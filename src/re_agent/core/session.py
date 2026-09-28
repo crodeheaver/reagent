@@ -8,7 +8,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,11 @@ class Session:
         if getattr(self, "_lease_owner", None) == owner:
             yield
             return
-        with file_lock(self.path.with_suffix(".coordinator"), blocking=False):
+        with ExitStack() as lease:
+            try:
+                lease.enter_context(file_lock(self.path.with_suffix(".coordinator"), blocking=False))
+            except BlockingIOError:
+                raise RuntimeError(f"Session file {self.path} is in use by another re-agent run") from None
             self._lease_owner = owner
             try:
                 if self.path.exists():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
@@ -26,20 +27,27 @@ def atomic_json(path: Path, data: Any) -> None:
 
 @contextmanager
 def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Hold an exclusive lock; non-blocking contention raises BlockingIOError on every platform."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(path.suffix + ".lock").open("a+b") as handle:
-        if os.name == "nt":
-            import msvcrt
+        try:
+            if os.name == "nt":
+                import msvcrt
 
-            handle.seek(0)
-            handle.write(b"0")
-            handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-        else:
-            import fcntl
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            else:
+                import fcntl
 
-            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except OSError as exc:
+            # flock reports EWOULDBLOCK; msvcrt reports EACCES or EDEADLOCK.
+            if blocking or exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK}:
+                raise
+            raise BlockingIOError(errno.EWOULDBLOCK, "File is locked by another process", str(path)) from exc
         try:
             yield
         finally:

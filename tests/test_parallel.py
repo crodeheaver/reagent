@@ -210,7 +210,7 @@ def test_competing_coordinator_lease(setup, monkeypatch):
         first = pool.submit(reverse_parallel, targets[:1], config, backend, session, lambda c: Mock(), 1)
         assert entered.wait(10)
         try:
-            with pytest.raises(OSError):
+            with pytest.raises(RuntimeError, match="session.json is in use by another re-agent run"):
                 reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1)
         finally:
             release.set()
