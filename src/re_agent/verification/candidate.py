@@ -41,6 +41,25 @@ def extract_candidate_body(code: str) -> str:
     return code[open_brace : close_brace + 1].strip()
 
 
+def copy_project_tree(source: Path, destination: Path, state_file: str | Path | None = None) -> None:
+    """Copy a project without ReAgent's live state, tolerating files deleted mid-copy."""
+    state = ["*.coordinator.lock", "*.json.lock", "*.json.*.tmp", "*.json.execution.json", "*.execution.stop"]
+    if state_file:
+        state.append(Path(state_file).name + "*")  # Session, lock, status, stop and temp files.
+
+    def copy_present(src: str, dst: str) -> object:
+        try:
+            return shutil.copy2(src, dst)
+        except FileNotFoundError:
+            if os.path.lexists(src):
+                raise
+            return dst
+
+    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True, copy_function=copy_present,
+                    ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__", "*.pyc", *state))
+    _remap_links(destination, source)
+
+
 def create_candidate_overlay(
     target: FunctionTarget,
     code: str,
@@ -49,6 +68,7 @@ def create_candidate_overlay(
     report_dir: Path,
     project_root: Path | None = None,
     copy_project: bool = False,
+    state_file: str | Path | None = None,
 ) -> Path:
     """Write a source overlay with the original function body replaced."""
     safe_address = _sanitize_path_component(target.address)
@@ -58,15 +78,7 @@ def create_candidate_overlay(
             if project_root is None:
                 raise ValueError("project_root is required when copy_project is enabled")
             overlay_root = Path(tempfile.mkdtemp(prefix=f"re-agent-{safe_address}-"))
-            shutil.copytree(
-                project_root,
-                overlay_root,
-                dirs_exist_ok=True,
-                symlinks=True,
-                ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__",
-                                               "*.pyc", "*.coordinator.lock"),
-            )
-            _remap_links(overlay_root, project_root)
+            copy_project_tree(project_root, overlay_root, state_file)
         else:
             overlay_root = report_dir / "candidates" / safe_address
         overlay_root.mkdir(parents=True, exist_ok=True)

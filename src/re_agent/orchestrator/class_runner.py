@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -19,7 +18,7 @@ from re_agent.llm.protocol import LLMProvider
 from re_agent.orchestrator.parallel import ProviderFactory, reverse_parallel
 from re_agent.orchestrator.single import reverse_single, validate_result
 from re_agent.parity.source_indexer import SourceIndexer
-from re_agent.verification.candidate import _remap_links, create_candidate_overlay
+from re_agent.verification.candidate import copy_project_tree, create_candidate_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -171,14 +170,7 @@ def _reverse_class_run(
     session = session or Session(config.output.session_file)
     with tempfile.TemporaryDirectory(prefix="re-agent-class-") as directory:
         scratch = Path(directory)
-        shutil.copytree(
-            original,
-            scratch,
-            dirs_exist_ok=True,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__", "*.coordinator.lock"),
-        )
-        _remap_links(scratch, original)
+        copy_project_tree(original, scratch, config.output.session_file)
         isolated = copy.deepcopy(config)
         isolated.validation.project_root = str(scratch)
         isolated.project_profile.source_root = str(scratch / relative_source)
