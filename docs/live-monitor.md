@@ -6,7 +6,12 @@
 re-agent monitor --work-dir /path/to/project --session-glob re-agent-progress.json --total 500
 ```
 
-Open the printed `http://127.0.0.1:8765` address. The page refreshes every two seconds and shows saved function results, review passes, failures, rounds, and recent log output. Omit `--total` when the planned count is unknown. A review pass is not a proof of compilation or binary equivalence.
+Open the printed `http://127.0.0.1:8765` address. The page updates live over a local WebSocket and shows saved function results, review passes, failures, rounds, and recent log output. Omit `--total` when the planned count is unknown. A review pass is not a proof of compilation or binary equivalence.
+
+The host checks session, log, progress and event files every 500 ms. Each browser tab
+receives one full snapshot when it connects, then only the fields and agents that
+changed; the refresh clock, source-data age and elapsed-time details travel in a small
+tick about once a second. Reconnecting loads a fresh snapshot.
 
 Session patterns are relative to `--work-dir` and can be repeated. For a batch runner:
 
@@ -18,11 +23,8 @@ The monitor deduplicates function addresses across matching files using their la
 
 ## Optional worker controls
 
-Install the optional process-management dependency:
-
-```sh
-pip install 'auto-re-agent[monitor]'
-```
+Worker controls need no extra install: `psutil` and `wsproto` are core dependencies.
+The `auto-re-agent[monitor]` extra is kept, empty, so older install commands still work.
 
 Supply an explicit argument array after `--worker`, which must be the last monitor option:
 
@@ -41,10 +43,14 @@ Control records and worker stdout/stderr live in `reports/monitor` by default; o
 
 ## Local access
 
-The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
-# External batch progress
+The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. The data endpoints (`/api/status`, `/api/agent-history`) answer only the dashboard page itself (same-origin fetch metadata) or requests carrying that token, so other websites cannot make the monitor read logs on their behalf. The live stream accepts only the dashboard's own origin, and at most 16 streams (browser tabs) at once. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
 
-Use the existing dashboard for a separately launched batch runner:
+## External batch progress
+
+`--progress-file`, `--stop-file` and `--event-glob` are for a separately launched
+batch runner, such as a script that drives native Grok subagents. `re-agent reverse`
+does not write these files; for its own runs, use `--session-glob` and `--log-glob`.
+Use the existing dashboard for such a runner:
 
 ```console
 re-agent monitor --work-dir /path/to/run --progress-file status.json --stop-file STOP --log-glob "batch-*/stderr.log"
@@ -55,14 +61,18 @@ or restart the external process. Stop creates the configured cooperative signal;
 the runner must watch it and cancel its own children. Omit `--stop-file` for
 read-only reporting. To enable Start / resume, also configure `--worker` (last option) and `--stop-file`.
 The monitor clears the stop signal before launching its managed worker and refuses
-a duplicate launch while the recorded process exists. The runner must implement
-checkpoint recovery; the monitor does not reinterpret its saved work.
+a duplicate launch while the process recorded in the progress file still exists. The
+runner should record its `pid` and, to guard against PID reuse, its process `created`
+time as reported by `psutil.Process().create_time()`. Without `created`, the PID only
+blocks a launch while the progress file is fresh (updated within 60 seconds). The runner
+must implement checkpoint recovery; the monitor does not reinterpret its saved work.
 
 The progress JSON uses `phase`, Unix-second `started`, `updated` and
 `batch_started` timestamps, and integer `total`, `completed`, `compiled`, `failed`,
 `verified`, `batch`, `batches`, `child_started`, `child_returned` and
 `active_children` counters. `recent` contains rows with `address`, `compiled` and
-optional `diagnostic`; optional `error` describes a run-level failure.
+optional `diagnostic`; optional `error` describes a run-level failure. Optional `pid`
+and `created` identify the runner process, as described above.
 Active phases are `opening-analysis`, `exporting-evidence`, `native-subagents` and
 `validating-candidates`. Updates older than 60 seconds are marked stale; this is
 a freshness indication, not proof that a process has exited.
@@ -70,17 +80,20 @@ a freshness indication, not proof that a process has exited.
 Compiled drafts are explicitly distinguished from accepted reconstructions.
 Child counts describe starts and collected results, not measured model-request
 concurrency. The existing layout displays elapsed time, throughput, batch
-progress, diagnostics and source-data age. The browser receives an initial snapshot over `/api/stream`, followed by WebSocket
-updates. Reconnects load a fresh snapshot; no periodic browser status requests are used.
-The host checks local progress files every 500 ms. Controls remain authenticated HTTP POSTs.
+progress, diagnostics and source-data age.
 
 Use `--event-glob "batch-*/native.jsonl"` to enable the agent workspace for native
 Grok event logs. Select the live batch or an earlier batch, then an agent to inspect
 its code, full response, and tool activity. Unattributed token events stay in a
 shared stream; child results are assigned only by provider task IDs. Thought events
-are excluded. Each agent text/log tail is bounded to 64 KiB, with at most 128 recent
-agents retained. Historical reads are limited to 32 MiB per source. The source must
-match the configured pattern inside the run directory.
+are excluded. Each agent keeps the last 65,536 characters of its text and of its
+activity log. Agent IDs are shortened to 128 characters (a digest keeps long IDs
+distinct), labels to 256 and statuses to 64, and at most 128 recently active agents are
+retained. Malformed or excessively nested lines are skipped. The live batch follows the
+most recently modified matching log; when that changes, or the log is truncated, replaced
+or rewritten, the view restarts from the new log instead of mixing batches. Historical reads are
+limited to 32 MiB per source. The source must match the configured pattern inside the
+run directory.
 
 ## Native Windows session storage
 

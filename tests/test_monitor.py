@@ -122,6 +122,26 @@ def test_managed_batch_resume_clears_stop_and_prevents_duplicate(tmp_path):
             monitor.process.wait(timeout=5)
 
 
+@pytest.mark.parametrize(("fields", "blocked"), [
+    ({"created": "actual"}, True), ({"created": 0}, False),
+    ({"updated": "now"}, True), ({"updated": "stale"}, False), ({}, False),
+])
+def test_managed_start_checks_recorded_pid_identity(tmp_path, fields, blocked):
+    # The progress file names a live PID (this test process), as a reused PID would.
+    current = psutil.Process()
+    values = {"actual": current.create_time(), "now": time.time(), "stale": time.time() - 120}
+    progress = {"pid": current.pid, **{key: values.get(value, value) for key, value in fields.items()}}
+    (tmp_path / "status.json").write_text(json.dumps(progress))
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "pass"],
+                      progress_file="status.json", stop_file="STOP")
+    if blocked:
+        with pytest.raises(ValueError, match="duplicate launch"):
+            monitor.start()
+    else:
+        assert monitor.start()["message"] == "Worker started"
+        monitor.process.wait(timeout=10)
+
+
 def test_worker_tree_stop_duplicate_start_and_host_reconnect(tmp_path):
     script = tmp_path / "worker with spaces.py"
     script.write_text(
@@ -236,6 +256,43 @@ def test_natural_exit_is_distinct_from_explicit_stop(tmp_path):
     assert Monitor(tmp_path, tmp_path / "state", [], worker=command).snapshot()["phase"] == "exited"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows does not keep zombie processes")
+def test_exited_worker_is_reaped_while_monitoring(tmp_path):
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "import time; time.sleep(.3)"])
+    pid = monitor.start()["pid"]
+    deadline = time.monotonic() + 10
+    while psutil.pid_exists(pid) and time.monotonic() < deadline:
+        monitor.snapshot()
+        time.sleep(.05)
+    assert not psutil.pid_exists(pid)
+    assert monitor.snapshot()["phase"] == "exited"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="taskkill does not wait for SIGTERM")
+def test_snapshots_stay_live_while_stop_waits_for_exit(tmp_path):
+    script = tmp_path / "stubborn.py"
+    script.write_text("import pathlib, signal, time\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "pathlib.Path('ready').touch()\n"
+                      "time.sleep(60)\n", encoding="utf-8")
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, str(script)])
+    monitor.start()
+    stopper = threading.Thread(target=monitor.stop)
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "ready").exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        stopper.start()
+        time.sleep(.5)
+        assert stopper.is_alive()  # Waiting for the ignored SIGTERM before escalating.
+        began = time.monotonic()
+        assert monitor.snapshot()["phase"] in {"running", "stopped"}
+        assert time.monotonic() - began < 2
+    finally:
+        stopper.join(timeout=30)
+        assert not monitor.active()
+
+
 @pytest.fixture
 def http_monitor(tmp_path):
     monitor = Monitor(tmp_path, tmp_path / "state", [])
@@ -257,9 +314,32 @@ def test_http_serves_packaged_ui_and_read_only_status(http_monitor):
         assert "Reconstruction, live." in html
         assert "__TOKEN__" not in html
         assert response.headers["Cache-Control"] == "no-store"
-    with urllib.request.urlopen(url + "/api/status") as response:
+    token = re.search(r'const token = "([^"]+)"', html).group(1)
+    request = urllib.request.Request(url + "/api/status", headers={"X-Control-Token": token})
+    with urllib.request.urlopen(request) as response:
         state = json.load(response)
         assert not state["controls"]
+
+
+@pytest.mark.parametrize(("path", "headers", "allowed"), [
+    ("/api/status", {}, False),
+    ("/api/status", {"X-Control-Token": "wrong"}, False),
+    ("/api/status", {"Sec-Fetch-Site": "cross-site"}, False),
+    ("/api/status", {"Sec-Fetch-Site": "same-origin"}, True),
+    ("/api/agent-history?source=x", {}, False),
+    ("/api/agent-history?source=x", {"Sec-Fetch-Site": "same-site"}, False),
+])
+def test_data_endpoints_require_the_page_or_its_token(http_monitor, path, headers, allowed):
+    # A cross-site page can make the browser send these GETs; they must not do work for it.
+    _, url = http_monitor
+    request = urllib.request.Request(url + path, headers=headers)
+    if allowed:
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+    else:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 403
 
 
 @pytest.mark.parametrize("headers", [{}, {"X-Control-Token": "wrong"}, {"Host": "untrusted.example"}])
@@ -345,3 +425,91 @@ def test_parallel_stop_requests_cleanup_then_force_stops(tmp_path):
     finally:
         if monitor.active():
             monitor.stop()
+
+
+def test_vanishing_event_log_does_not_break_snapshot(tmp_path, monkeypatch):
+    (tmp_path / "b1").mkdir()
+    (tmp_path / "b1" / "native.jsonl").write_text('{"type":"text","data":"x"}\n')
+    monitor = Monitor(tmp_path, tmp_path / "state", [], event_glob="*/native.jsonl")
+    assert monitor.snapshot()["agents"][0]["text"] == "x"
+
+    def vanished(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(monitor.agent_events, "read", vanished)
+    state = monitor.snapshot()
+    assert state["event_sources"] == ["b1/native.jsonl"]
+    assert state["agents"][0]["text"] == "x"
+
+
+def test_http_errors_are_answered_not_dropped(http_monitor, monkeypatch):
+    monitor, url = http_monitor
+    with urllib.request.urlopen(url) as response:
+        token = re.search(r'const token = "([^"]+)"', response.read().decode()).group(1)
+
+    def failing(*_args):
+        raise psutil.NoSuchProcess(1)
+
+    monkeypatch.setattr(monitor, "snapshot", failing)
+    monkeypatch.setattr(monitor, "stop", failing)
+    requests = [urllib.request.Request(url + "/api/status", headers={"X-Control-Token": token}),
+                urllib.request.Request(url + "/api/stop", method="POST", headers={"X-Control-Token": token})]
+    for request in requests:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code in (400, 503)
+        assert "error" in json.load(error.value)
+
+
+def test_history_source_vanishing_mid_read_is_answered(tmp_path, monkeypatch):
+    from re_agent.monitor.events import AgentEvents
+
+    (tmp_path / "gone.jsonl").write_text('{"type":"text","data":"x"}\n')
+    monitor = Monitor(tmp_path, tmp_path / "state", [], event_glob="*.jsonl")
+    server = make_server(monitor, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(base) as response:
+            token = re.search(r'const token = "([^"]+)"', response.read().decode()).group(1)
+
+        def vanished(self, path):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(AgentEvents, "read", vanished)
+        request = urllib.request.Request(base + "/api/agent-history?source=gone.jsonl",
+                                         headers={"X-Control-Token": token})
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal path")
+def test_stop_reports_a_worker_that_will_not_exit(tmp_path, monkeypatch):
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "import time; time.sleep(60)"])
+    monitor.start()
+    process = monitor.process
+    try:
+        def never(timeout=None):
+            raise psutil.TimeoutExpired(timeout, process.pid)
+
+        monkeypatch.setattr(monitor, "_adopt", lambda: None)
+        monkeypatch.setattr(monitor, "process", psutil.Process(process.pid))
+        monkeypatch.setattr(monitor.process, "wait", never)
+        with pytest.raises(RuntimeError, match="did not exit"):
+            monitor.stop()
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def test_monitor_dependencies_are_core_and_the_extra_still_installs():
+    tomllib = pytest.importorskip("tomllib")
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert {dep.split(">")[0].split("=")[0] for dep in project["dependencies"]} >= {"psutil", "wsproto"}
+    assert "monitor" in project["optional-dependencies"]  # `pip install auto-re-agent[monitor]` keeps working

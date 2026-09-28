@@ -386,6 +386,22 @@
       let retryDelay = 1000;
       let streamWatchdog;
       let agentRows = [];
+      let state = null;
+      function renderLive(s) {
+        // Clock-driven fields arrive in small "tick" messages between full renders.
+        el("run-details").hidden = !(s.details || []).length;
+        el("detail-rows").replaceChildren();
+        for (const detail of s.details || []) {
+          const tr = document.createElement("tr");
+          for (const value of [detail.label, detail.value]) {
+            const td = document.createElement("td"); td.textContent = value; tr.append(td);
+          }
+          el("detail-rows").append(tr);
+        }
+        el("connection").textContent =
+          `Connected · refreshed ${s.updated} · live WebSocket` +
+          (s.data_age_s == null ? "" : ` · source data ${Math.floor(s.data_age_s)}s old`);
+      }
       function render(s) {
         try {
           let pct = s.targets
@@ -425,15 +441,6 @@
           for (let k of ["completed", "passed", "failed", "rounds"])
             el(k).textContent = fmt(s[k]);
           el("log").textContent = [s.diagnostics, s.log].filter(Boolean).join("\n\n").replace(/\x1b\[[0-9;]*m/g, "") || "Waiting for worker output…";
-          el("run-details").hidden = !(s.details || []).length;
-          el("detail-rows").replaceChildren();
-          for (const detail of s.details || []) {
-            const tr = document.createElement("tr");
-            for (const value of [detail.label, detail.value]) {
-              const td = document.createElement("td"); td.textContent = value; tr.append(td);
-            }
-            el("detail-rows").append(tr);
-          }
           let lines = (s.log || "").trim().split("\n");
           el("activity").textContent = s.error
             ? JSON.stringify(s.error)
@@ -477,9 +484,7 @@
           el("stop").textContent = s.phase === "stopping" ? (s.force_stop === false ? "Stopping…" : "Force stop") : "Stop run";
           el("start").disabled = busy || s.active || !s.controls || s.can_start === false;
           el("stop").disabled = busy || !s.active || !s.controls || s.can_stop === false;
-          el("connection").textContent =
-            `Connected · refreshed ${s.updated} · live WebSocket` +
-            (s.data_age_s == null ? "" : ` · source data ${Math.floor(s.data_age_s)}s old`);
+          renderLive(s);
           el("path").textContent = s.output;
         } catch (e) {
           el("connection").textContent =
@@ -519,9 +524,20 @@
         const watchdog = () => { clearTimeout(streamWatchdog); streamWatchdog = setTimeout(() => socket.close(), 15000); };
         watchdog();
         socket.onmessage = event => {
+          // The host sends one snapshot, then only changed fields and changed agents.
           const message = JSON.parse(event.data);
-          if (!["snapshot", "update"].includes(message.type)) return;
-          retryDelay = 1000; watchdog(); render(message.data);
+          if (message.type === "snapshot") state = message.data;
+          else if (["update", "tick"].includes(message.type) && state) {
+            Object.assign(state, message.data);
+            for (const key of message.removed || []) delete state[key];
+            if (message.agents) {
+              const known = new Map((state.agents || []).map(agent => [agent.id, agent]));
+              for (const agent of message.agents.changed) known.set(agent.id, agent);
+              state.agents = message.agents.order.map(id => known.get(id)).filter(Boolean);
+            }
+          } else return;
+          retryDelay = 1000; watchdog();
+          if (message.type === "tick") renderLive(state); else render(state);
         };
         socket.onclose = () => {
           clearTimeout(streamWatchdog);
@@ -598,7 +614,9 @@
         const source = el("batch-select").value;
         if (!source) return;
         try {
-          const response = await fetch(`/api/agent-history?source=${encodeURIComponent(source)}`);
+          const response = await fetch(`/api/agent-history?source=${encodeURIComponent(source)}`, {
+            headers: { "X-Control-Token": token },
+          });
           if (!response.ok) throw Error("Cannot load agent history");
           const history = await response.json();
           if (el("batch-select").value !== source) return;

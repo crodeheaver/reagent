@@ -14,8 +14,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import psutil
+
 from re_agent.monitor.events import AgentEvents
 from re_agent.utils.storage import atomic_json, file_lock
+
+# External progress older than this is shown as stale and no longer vouches for its PID.
+STALE_AFTER_S = 60
+# Snapshot fields that change with the clock alone; streamed as small ticks, not full updates.
+VOLATILE = ("updated", "data_age_s", "details")
+# Each live stream holds a thread polling snapshots; a few tabs are plenty for a local dashboard.
+MAX_STREAMS = 16
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -58,19 +67,27 @@ class Monitor:
         self.worker = worker or []
         self.record = self.state_dir / "worker.json"
         self.process: Any = None
-        self.psutil: Any = None
-        if self.worker:
-            try:
-                import psutil
-            except ImportError as exc:
-                raise RuntimeError("Worker controls require: pip install 'auto-re-agent[monitor]'") from exc
-            self.psutil = psutil
+        self.psutil: Any = psutil
         self.lock = threading.RLock()
+        # Start/stop wait for processes; a separate lock keeps snapshots and streams live meanwhile.
+        self.control = threading.Lock()
         self.cache: dict[Path, tuple[tuple[int, int], list[dict[str, Any]]]] = {}
         self._adopt()
 
+    def matches(self, pattern: str, contained: bool = False) -> list[Path]:
+        """Files matching a configured pattern; directories vanishing mid-scan yield no match."""
+        try:
+            return [p for p in self.work_dir.glob(pattern)
+                    if p.is_file() and (not contained or p.resolve().is_relative_to(self.work_dir))]
+        except (OSError, RuntimeError):
+            return []
+
     def _adopt(self) -> None:
         if not self.worker:
+            return
+        if isinstance(self.process, self.psutil.Popen) and self.process.poll() is None:
+            # Keep our own child's handle: polling it reaps the worker once it exits,
+            # whereas an adopted psutil.Process would leave it a zombie.
             return
         saved = read_json(self.record)
         try:
@@ -100,15 +117,12 @@ class Monitor:
     def start(self) -> dict[str, Any]:
         if not self.worker:
             raise ValueError("Read-only monitor: no worker command configured")
-        with self.lock, file_lock(self.record):
+        with self.control, file_lock(self.record):
             self._adopt()
             if self.active():
                 return {"message": "Already running", "pid": self.process.pid}
-            if self.progress_file:
-                saved_progress = read_json(self.progress_file)
-                pid = saved_progress.get("pid")
-                if type(pid) is int and self.psutil.pid_exists(pid):
-                    raise ValueError("A recorded external worker still exists; refusing a duplicate launch")
+            if self.progress_file and self.external_worker_alive():
+                raise ValueError("A recorded external worker still exists; refusing a duplicate launch")
             if self.stop_file:
                 if not self.stop_file.resolve().is_relative_to(self.work_dir):
                     raise ValueError("Stop file escaped the working directory")
@@ -128,12 +142,26 @@ class Monitor:
                                       "cwd": str(self.work_dir), "phase": "running"})
             return {"message": "Worker started", "pid": self.process.pid}
 
+    def external_worker_alive(self) -> bool:
+        """Whether the progress file's PID is still its writer, not a reused PID."""
+        progress = read_json(self.progress_file) if self.progress_file else {}
+        pid, created, updated = progress.get("pid"), progress.get("created"), progress.get("updated")
+        if type(pid) is not int or pid <= 0:
+            return False
+        try:
+            process = psutil.Process(pid)
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False
+            if isinstance(created, (int, float)):
+                return bool(abs(process.create_time() - created) < 1e-3)
+        except psutil.Error:
+            return False
+        # Without a creation time the PID may belong to another process; trust it only while fresh.
+        return isinstance(updated, (int, float)) and 0 <= time.time() - updated < STALE_AFTER_S
+
     def executions(self) -> list[tuple[Path, dict[str, Any]]]:
         """Read adjacent status files, verifying PID birth time before displaying activity."""
-        import psutil
-
-        paths = {p for pattern in self.session_globs
-                 for p in self.work_dir.glob(pattern + ".execution.json") if p.is_file()}
+        paths = {p for pattern in self.session_globs for p in self.matches(pattern + ".execution.json")}
         result = []
         for path in sorted(paths):
             data = read_json(path)
@@ -162,12 +190,15 @@ class Monitor:
             return {"message": "Cooperative stop requested; the external runner handles cancellation."}
         if not self.worker:
             raise ValueError("Read-only monitor: no worker command configured")
-        with self.lock, file_lock(self.record):
+        with self.control, file_lock(self.record):
             self._adopt()
             if self.active():
                 # Provider and compiler CLIs run in their own sessions, outside the
                 # worker's process group; collect them before the worker exits.
-                descendants = self.process.children(recursive=True)
+                try:
+                    descendants = self.process.children(recursive=True)
+                except self.psutil.Error:
+                    descendants = []  # The worker exited meanwhile; its process group is still signalled.
                 owned = {self.process.pid, *(child.pid for child in descendants)}
                 executions = [(path, data) for path, data in self.executions()
                               if data.get("alive") and data.get("pid") in owned
@@ -185,11 +216,13 @@ class Monitor:
                 else:
                     import signal
 
-                    os.killpg(self.process.pid, signal.SIGTERM)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(self.process.pid, signal.SIGTERM)
                     try:
                         self.process.wait(timeout=5)
                     except self.psutil.TimeoutExpired:
-                        os.killpg(self.process.pid, signal.SIGKILL)
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(self.process.pid, signal.SIGKILL)
                     # Descendants can ignore SIGTERM even when the parent exits.
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(self.process.pid, signal.SIGKILL)
@@ -197,7 +230,10 @@ class Monitor:
                     with contextlib.suppress(self.psutil.Error):
                         child.kill()
                 self.psutil.wait_procs(descendants, timeout=5)
-                self.process.wait(timeout=20)
+                try:
+                    self.process.wait(timeout=20)
+                except self.psutil.TimeoutExpired as exc:
+                    raise RuntimeError(f"Worker {self.process.pid} did not exit after being killed") from exc
                 saved = read_json(self.record)
                 saved.update(phase="stopped", stopped_at=time.time())
                 atomic_json(self.record, saved)
@@ -205,7 +241,7 @@ class Monitor:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            paths = {p for pattern in self.session_globs for p in self.work_dir.glob(pattern) if p.is_file()}
+            paths = {p for pattern in self.session_globs for p in self.matches(pattern)}
             for stale in self.cache.keys() - paths:
                 del self.cache[stale]
             functions: dict[str, dict[str, Any]] = {}
@@ -234,8 +270,7 @@ class Monitor:
             rounds = sum(row["rounds_used"] for row in recent if type(row.get("rounds_used")) is int)
             tail = ""
             try:
-                logs = (list(self.work_dir.glob(self.log_glob)) if self.log_glob
-                        else [self.state_dir / "worker.stderr.log"])
+                logs = self.matches(self.log_glob) if self.log_glob else [self.state_dir / "worker.stderr.log"]
                 log = max((p for p in logs if p.is_file()), key=lambda p: p.stat().st_mtime_ns, default=None)
                 if log:
                     with log.open("rb") as stream:
@@ -260,14 +295,25 @@ class Monitor:
             if self.progress_file is not None:
                 snapshot.update(self.external_progress())
             if self.event_glob:
-                event_paths = [p for p in self.work_dir.glob(self.event_glob)
-                         if p.is_file() and p.resolve().is_relative_to(self.work_dir)]
-                latest = max(event_paths, key=lambda p: p.stat().st_mtime_ns, default=None)
-                if latest:
-                    snapshot["agents"] = self.agent_events.read(latest)
-                snapshot["event_sources"] = [str(p.relative_to(self.work_dir)).replace("\\", "/")
-                                             for p in sorted(event_paths)]
+                snapshot.update(self.live_agents())
             return snapshot
+
+    def live_agents(self) -> dict[str, Any]:
+        """Follow the most recently modified event log; logs may vanish between scan and read."""
+        stamped = []
+        for path in self.matches(self.event_glob or "__no_events__", contained=True):
+            with contextlib.suppress(OSError):
+                stamped.append((path.stat().st_mtime_ns, path))
+        result: dict[str, Any] = {"event_sources": sorted(
+            str(p.relative_to(self.work_dir)).replace("\\", "/") for _, p in stamped)}
+        if stamped:
+            latest = max(stamped)[1]
+            try:
+                result["agents"] = self.agent_events.read(latest)
+            except OSError:
+                if self.agent_events.path == latest:
+                    result["agents"] = self.agent_events.view()
+        return result
 
     def external_progress(self) -> dict[str, Any]:
         """Adapt a cooperative batch runner's progress without adopting its process."""
@@ -277,7 +323,7 @@ class Monitor:
             return max(0, value) if type(value) is int else 0
         phase = str(data.get("phase", "waiting-for-progress"))
         updated = data.get("updated")
-        fresh = isinstance(updated, (int, float)) and 0 <= time.time() - updated < 60
+        fresh = isinstance(updated, (int, float)) and 0 <= time.time() - updated < STALE_AFTER_S
         running_phases = {"opening-analysis", "exporting-evidence", "native-subagents", "validating-candidates"}
         active = fresh and phase in running_phases
         if self.worker:
@@ -336,9 +382,47 @@ class Monitor:
                 "diagnostics": "\n".join(diagnostics)[-7000:]}
 
 
+class StreamDiff:
+    """One full snapshot per client, then only changed fields and changed agents."""
+
+    def __init__(self) -> None:
+        self.fields: dict[str, str] | None = None
+        self.agents: dict[str, str] = {}
+        self.order: list[str] = []
+
+    def message(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        agents = snapshot.get("agents") or []
+        fields = {key: json.dumps(value, sort_keys=True) for key, value in snapshot.items() if key != "agents"}
+        encoded = {agent["id"]: json.dumps(agent, sort_keys=True) for agent in agents}
+        order = [agent["id"] for agent in agents]
+        previous, known, known_order = self.fields, self.agents, self.order
+        self.fields, self.agents, self.order = fields, encoded, order
+        if previous is None:
+            return {"type": "snapshot", "data": snapshot}
+        volatile = {key: snapshot[key] for key in VOLATILE if key in snapshot}
+        changed = {key: snapshot[key] for key, value in fields.items()
+                   if key not in VOLATILE and previous.get(key) != value}
+        removed = [key for key in previous if key not in fields]
+        patch = [agent for agent in agents if known.get(agent["id"]) != encoded[agent["id"]]]
+        if changed or removed or patch or order != known_order:
+            message: dict[str, Any] = {"type": "update", "data": {**changed, **volatile}}
+            if removed:
+                message["removed"] = removed
+            if patch or order != known_order:
+                message["agents"] = {"order": order, "changed": patch}
+            return message
+        if any(previous.get(key) != fields.get(key) for key in VOLATILE):
+            return {"type": "tick", "data": volatile}
+        return None
+
+
 def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
     """Bind only loopback; never accept worker commands from HTTP clients."""
     token = secrets.token_urlsafe(32)
+    streams = threading.BoundedSemaphore(MAX_STREAMS)
+
+    def has_token(value: str | None) -> bool:
+        return value is not None and secrets.compare_digest(value.encode("latin-1", "replace"), token.encode())
 
     class Handler(BaseHTTPRequestHandler):
         server: ThreadingHTTPServer
@@ -357,32 +441,49 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
         def valid_host(self) -> bool:
             return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
 
+        def may_read(self) -> bool:
+            # Any site can make a browser send simple GETs to loopback. Data endpoints answer
+            # only this page (same-origin fetch metadata) or holders of the page's token.
+            return (has_token(self.headers.get("X-Control-Token"))
+                    or self.headers.get("Sec-Fetch-Site") == "same-origin")
+
         def do_GET(self) -> None:
             if not self.valid_host():
                 self.reply(403, '{"error":"Invalid host"}')
             elif self.path == "/":
                 html = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
                 self.reply(200, html.replace("__TOKEN__", token), "text/html")
-            elif self.path == "/api/status":
-                self.reply(200, json.dumps(monitor.snapshot()))
             elif self.path == "/api/stream":
-                self.stream()
+                self.stream()  # Browsers cannot forge the Origin that the upgrade checks.
+            elif self.path.startswith("/api/") and not self.may_read():
+                self.reply(403, '{"error":"Data request rejected"}')
+            elif self.path == "/api/status":
+                try:
+                    body = json.dumps(monitor.snapshot())
+                except Exception as exc:  # Always answer; a dashboard must not drop requests.
+                    self.reply(503, json.dumps({"error": f"Monitor state unavailable: {exc}"}))
+                    return
+                self.reply(200, body)
             elif urlsplit(self.path).path == "/api/agent-history":
                 source = parse_qs(urlsplit(self.path).query).get("source", [""])[0]
                 allowed = {str(p.relative_to(monitor.work_dir)).replace("\\", "/"): p
-                           for p in monitor.work_dir.glob(monitor.event_glob or "__no_events__")
-                           if p.is_file() and p.resolve().is_relative_to(monitor.work_dir)}
+                           for p in monitor.matches(monitor.event_glob or "__no_events__", contained=True)}
                 if source not in allowed:
                     self.reply(404, '{"error":"Unknown event source"}')
                     return
                 reader = AgentEvents()
                 path = allowed[source]
-                # Bound historical reads; the live stream remains incremental.
-                for _ in range(32):
-                    agents = reader.read(path)
-                    if reader.offset >= path.stat().st_size:
-                        break
-                self.reply(200, json.dumps({"agents": agents, "truncated": reader.offset < path.stat().st_size}))
+                try:
+                    # Bound historical reads; the live stream remains incremental.
+                    for _ in range(32):
+                        agents = reader.read(path)
+                        if reader.offset >= path.stat().st_size:
+                            break
+                    truncated = reader.offset < path.stat().st_size
+                except OSError:
+                    self.reply(404, '{"error":"Event source unavailable"}')
+                    return
+                self.reply(200, json.dumps({"agents": agents, "truncated": truncated}))
             else:
                 self.reply(404, '{"error":"Not found"}')
 
@@ -395,6 +496,9 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
             if self.headers.get("Origin") != origin or self.headers.get("Upgrade", "").lower() != "websocket":
                 self.reply(403, '{"error":"Stream request rejected"}')
                 return
+            if not streams.acquire(blocking=False):
+                self.reply(503, '{"error":"Too many live streams; close another monitor tab"}')
+                return
             ws = WSConnection(ConnectionType.SERVER)
             self.close_connection = True
             try:
@@ -403,15 +507,16 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                 list(ws.events())
                 self.connection.settimeout(5)
                 self.connection.sendall(ws.send(AcceptConnection()))
-                previous = ""
-                first = True
+                diff = StreamDiff()
                 while True:
-                    data = monitor.snapshot()
-                    encoded = json.dumps(data)
-                    if encoded != previous:
-                        self.connection.sendall(ws.send(TextMessage(data=json.dumps({
-                            "type": "snapshot" if first else "update", "data": data}))))
-                        previous, first = encoded, False
+                    try:
+                        data = monitor.snapshot()
+                    except Exception:  # Tell the client instead of dropping the socket; it reconnects.
+                        self.connection.sendall(ws.send(CloseConnection(code=1011, reason="Monitor state unavailable")))
+                        return
+                    message = diff.message(data)
+                    if message is not None:
+                        self.connection.sendall(ws.send(TextMessage(data=json.dumps(message))))
                     ready, _, _ = select.select([self.connection], [], [], 0.5)
                     if ready:
                         payload = self.connection.recv(4096)
@@ -429,11 +534,13 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                                 return
             except (OSError, ProtocolError, ValueError):
                 return
+            finally:
+                streams.release()
 
         def do_POST(self) -> None:
             origin = f"http://127.0.0.1:{self.server.server_port}"
             if (not self.valid_host() or self.headers.get("Origin") not in (None, origin)
-                    or self.headers.get("X-Control-Token") != token):
+                    or not has_token(self.headers.get("X-Control-Token"))):
                 self.reply(403, '{"error":"Control request rejected"}')
                 return
             try:
@@ -445,7 +552,7 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                     self.reply(404, '{"error":"Not found"}')
                     return
                 self.reply(200, json.dumps(result))
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, psutil.Error) as exc:
                 self.reply(400, json.dumps({"error": str(exc)}))
 
         def log_message(self, format: str, *args: Any) -> None:
