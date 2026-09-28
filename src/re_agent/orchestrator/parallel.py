@@ -95,7 +95,11 @@ class LockedBackend:
 
 
 class WorkerSession(Session):
+    """In-memory session view for one attempt; the coordinator owns the session file."""
+
     def __init__(self, feedback: str, emit: Callable[[str, Any], None], offset: int):
+        self._lease_owner = None
+        self._data = {"functions": {}, "runs": []}
         self.feedback, self.emit, self.offset = feedback, emit, offset
 
     def previous_feedback(self, address: str) -> str:
@@ -273,7 +277,8 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                     emit(job, "fatal", {"category": "configuration", "message": str(exc)})
                     cancel.set()
                     raise
-                feedback = json.dumps(snapshot.get("checkpoint", {}))
+                checkpoint = snapshot.get("checkpoint")
+                feedback = json.dumps(checkpoint, indent=2) if checkpoint else ""
                 result = reverse_single(t, isolated, cast(REBackend, LockedBackend(backend, backend_lock, cancel)),
                     providers[0], checker_llm=providers[1], session=WorkerSession(
                         feedback, lambda kind, value: emit(job, kind, value), offset))

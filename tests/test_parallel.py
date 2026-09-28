@@ -123,6 +123,44 @@ def test_rerun_after_failed_job_without_code(setup, monkeypatch, outcome):
     assert all(rerun.attempt_count(t.address) == 1 for t in targets[:2])
 
 
+def test_resumed_job_with_artifacts_runs_real_pipeline_without_empty_feedback(tmp_path, monkeypatch):
+    from re_agent.backend.stub import StubBackend
+    from re_agent.orchestrator import parallel
+    from tests.test_agents.test_loop import MockLLM
+    from tests.test_audit_regressions import config_for
+
+    config = config_for(tmp_path)
+    config.validation.enabled = False
+    config.orchestrator.max_parallel_functions = 2
+    target = FunctionTarget("0x1", "C", "f")
+    session, cancel = Session(config.output.session_file), threading.Event()
+
+    def interrupted(target, cfg, *args, **kwargs):
+        code = Path(cfg.output.report_dir) / "code"
+        code.mkdir(parents=True)
+        (code / "draft.cpp").write_text("int f() { return 0; }")
+        cancel.set()
+        current().check()
+
+    real = parallel.reverse_single
+    monkeypatch.setattr(parallel, "reverse_single", interrupted)
+    assert reverse_parallel([target], config, StubBackend(), session, lambda c: Mock(), 1, cancel=cancel) == []
+    monkeypatch.setattr(parallel, "reverse_single", real)
+    prompts = []
+
+    class Recording(MockLLM):
+        def send(self, messages, **kwargs):
+            prompts.append(messages[-1].content)
+            return super().send(messages, **kwargs)
+
+    def factory(cfg):
+        return Recording(['```cpp\nint f() { return 1; }\n```', '{"verdict":"PASS"}'])
+
+    result = reverse_parallel([target], config, StubBackend(), session, factory, 1)
+    assert [r.success for r in result] == [True], result
+    assert prompts and "Previous attempt checkpoint" not in prompts[0]
+
+
 def test_competing_coordinator_lease(setup, monkeypatch):
     config, backend, targets, session = setup
     entered, release = threading.Event(), threading.Event()
