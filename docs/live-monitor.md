@@ -42,3 +42,53 @@ Control records and worker stdout/stderr live in `reports/monitor` by default; o
 ## Local access
 
 The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
+# External batch progress
+
+Use the existing dashboard for a separately launched batch runner:
+
+```console
+re-agent monitor --work-dir /path/to/run --progress-file status.json --stop-file STOP --log-glob "batch-*/stderr.log"
+```
+
+Both file paths must stay within the working directory. The monitor does not adopt
+or restart the external process. Stop creates the configured cooperative signal;
+the runner must watch it and cancel its own children. Omit `--stop-file` for
+read-only reporting. To enable Start / resume, also configure `--worker` (last option) and `--stop-file`.
+The monitor clears the stop signal before launching its managed worker and refuses
+a duplicate launch while the recorded process exists. The runner must implement
+checkpoint recovery; the monitor does not reinterpret its saved work.
+
+The progress JSON uses `phase`, Unix-second `started`, `updated` and
+`batch_started` timestamps, and integer `total`, `completed`, `compiled`, `failed`,
+`verified`, `batch`, `batches`, `child_started`, `child_returned` and
+`active_children` counters. `recent` contains rows with `address`, `compiled` and
+optional `diagnostic`; optional `error` describes a run-level failure.
+Active phases are `opening-analysis`, `exporting-evidence`, `native-subagents` and
+`validating-candidates`. Updates older than 60 seconds are marked stale; this is
+a freshness indication, not proof that a process has exited.
+
+Compiled drafts are explicitly distinguished from accepted reconstructions.
+Child counts describe starts and collected results, not measured model-request
+concurrency. The existing layout displays elapsed time, throughput, batch
+progress, diagnostics and source-data age. The browser receives an initial snapshot over `/api/stream`, followed by WebSocket
+updates. Reconnects load a fresh snapshot; no periodic browser status requests are used.
+The host checks local progress files every 500 ms. Controls remain authenticated HTTP POSTs.
+
+Use `--event-glob "batch-*/native.jsonl"` to enable the agent workspace for native
+Grok event logs. Select the live batch or an earlier batch, then an agent to inspect
+its code, full response, and tool activity. Unattributed token events stay in a
+shared stream; child results are assigned only by provider task IDs. Thought events
+are excluded. Each agent text/log tail is bounded to 64 KiB, with at most 128 recent
+agents retained. Historical reads are limited to 32 MiB per source. The source must
+match the configured pattern inside the run directory.
+
+## Native Windows session storage
+
+Keep native CLI session storage separate from deeply nested report directories.
+Grok embeds the encoded working directory and two session IDs in child output
+paths. On Windows, native callers can pass an explicitly allocated short `home`
+to `GrokCLIProvider._isolated_environment(..., native_subagents=True)`. The helper
+checks a conservative 240-character output-path budget before creating the home.
+It preserves the original auth path and managed requirements without copying
+credentials. The caller owns the separate home and its retention/cleanup. Use a
+new isolated directory for a clean run; existing homes are never overwritten.

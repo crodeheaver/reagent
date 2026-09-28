@@ -63,6 +63,65 @@ def test_read_only_monitor_cannot_start_or_stop(tmp_path):
     assert not (tmp_path / "state").exists()
 
 
+def test_external_progress_preserves_draft_semantics_and_cooperative_stop(tmp_path):
+    data = {"phase": "native-subagents", "updated": time.time(), "total": 100,
+            "completed": 32, "compiled": 31, "failed": 1, "batch": 2, "batches": 4,
+            "child_started": 32, "child_returned": 16, "active_children": 16,
+            "recent": [{"address": "100", "compiled": True}]}
+    (tmp_path / "status.json").write_text(json.dumps(data))
+    monitor = Monitor(tmp_path, tmp_path / "state", [], progress_file="status.json", stop_file="STOP")
+    state = monitor.snapshot()
+    assert state["active"] and not state["can_start"]
+    assert state["passed_label"] == "Compiled drafts"
+    assert (state["completed"], state["passed"], state["failed"]) == (32, 31, 1)
+    assert not state["recent"][0]["success"]
+    assert state["recent"][0]["verdict"] == "Not reviewed"
+    assert state["data_age_s"] >= 0
+    assert any(item["label"] == "Throughput" for item in state["details"])
+    with pytest.raises(ValueError, match="Read-only"):
+        monitor.start()
+    monitor.stop()
+    assert (tmp_path / "STOP").exists()
+    assert monitor.snapshot()["phase"] == "stopping"
+    assert not monitor.snapshot()["can_stop"]
+    data["updated"] -= 120
+    (tmp_path / "status.json").write_text(json.dumps(data))
+    assert monitor.snapshot()["phase"] == "status-stale"
+    assert not monitor.snapshot()["active"]
+    (tmp_path / "status.json").write_text('{"phase": "completed", "recent": null}')
+    assert not monitor.snapshot()["active"]
+    assert monitor.snapshot()["recent"] == []
+
+
+@pytest.mark.parametrize("options", [
+    {"progress_file": "../status.json"}, {"progress_file": "status.json", "stop_file": "../STOP"},
+    {"stop_file": "STOP"}, {"progress_file": "status.json", "worker": ["python"]},
+])
+def test_external_progress_rejects_unsafe_or_ambiguous_configuration(tmp_path, options):
+    with pytest.raises(ValueError):
+        Monitor(tmp_path, tmp_path / "state", [], **options)
+
+
+def test_managed_batch_resume_clears_stop_and_prevents_duplicate(tmp_path):
+    (tmp_path / "STOP").touch()
+    monitor = Monitor(tmp_path, tmp_path / "state", [],
+                      worker=[sys.executable, "-c", "import time; time.sleep(30)"],
+                      progress_file="status.json", stop_file="STOP")
+    try:
+        first = monitor.start()
+        assert not (tmp_path / "STOP").exists()
+        assert monitor.start()["pid"] == first["pid"]
+        state = monitor.snapshot()
+        assert state["active"] and state["can_start"]
+        assert state["phase"] == "starting"
+        monitor.stop()
+        assert (tmp_path / "STOP").exists()
+    finally:
+        if monitor.process:
+            monitor.process.kill()
+            monitor.process.wait(timeout=5)
+
+
 def test_worker_tree_stop_duplicate_start_and_host_reconnect(tmp_path):
     script = tmp_path / "worker with spaces.py"
     script.write_text(
@@ -87,12 +146,15 @@ def test_worker_tree_stop_duplicate_start_and_host_reconnect(tmp_path):
         second.stop()
         assert not second.active()
         assert not first.active()
+        assert first.snapshot()["phase"] == "stopped"
+        assert Monitor(tmp_path, tmp_path / "state", [], worker=command).snapshot()["phase"] == "stopped"
         deadline = time.monotonic() + 5
         while child.is_running() and child.status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
             time.sleep(.02)
         assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
         first.start()
         assert first.active()
+        assert second.snapshot()["phase"] == "running"
         first.stop()
     finally:
         first.stop()
@@ -163,6 +225,17 @@ def test_stale_identity_and_unrelated_process_are_not_adopted(tmp_path):
     assert not Monitor(tmp_path, state, [], worker=current.cmdline()).active()
 
 
+def test_natural_exit_is_distinct_from_explicit_stop(tmp_path):
+    command = [sys.executable, "-c", "import time; time.sleep(.2)"]
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=command)
+    assert monitor.snapshot()["phase"] == "idle"
+    monitor.start()
+    monitor.process.wait(timeout=10)
+    assert monitor.snapshot()["phase"] == "exited"
+    monitor.stop()
+    assert Monitor(tmp_path, tmp_path / "state", [], worker=command).snapshot()["phase"] == "exited"
+
+
 @pytest.fixture
 def http_monitor(tmp_path):
     monitor = Monitor(tmp_path, tmp_path / "state", [])
@@ -231,3 +304,44 @@ def test_packaged_html_uses_text_nodes_for_untrusted_results():
     html = Path(server.__file__).with_name("index.html").read_text(encoding="utf-8")
     assert "textContent" in html
     assert "innerHTML" not in html
+
+
+def test_execution_status_reconciles_dead_process_and_preserves_verdicts(tmp_path):
+    session = tmp_path / "session.json"
+    save(session, {"1": {"address": "1", "success": False, "verdict": "PASS", "validation_verdict": "FAIL"}})
+    status = session.with_suffix(".json.execution.json")
+    status.write_text(json.dumps({"schema_version": 1, "phase": "running", "pid": 99999999, "created": 0,
+                                 "jobs": [{"address": "2", "state": "running", "stage": "reverser"}]}))
+    snapshot = Monitor(tmp_path, tmp_path / "state", ["session.json"]).snapshot()
+    assert snapshot["executions"][0]["phase"] == "interrupted"
+    assert snapshot["executions"][0]["jobs"][0]["stage"] == "interrupted"
+    assert snapshot["recent"][0]["verdict"] == "PASS"
+    assert snapshot["recent"][0]["validation_verdict"] == "FAIL"
+
+
+def test_parallel_stop_requests_cleanup_then_force_stops(tmp_path):
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "import json, os, pathlib, psutil, time\n"
+        "pathlib.Path('session.json').write_text('{}')\n"
+        "pathlib.Path('session.json.execution.json').write_text(json.dumps({"
+        "'schema_version': 1, 'phase': 'running', 'pid': os.getpid(), "
+        "'created': psutil.Process().create_time(), 'jobs': []}))\n"
+        "time.sleep(60)\n"
+    )
+    monitor = Monitor(tmp_path, tmp_path / "state", ["session.json"], worker=[sys.executable, str(script)])
+    monitor.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not monitor.executions() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert monitor.executions()
+        assert "Stop requested" in monitor.stop()["message"]
+        assert (tmp_path / "session.json.execution.stop").exists()
+        assert monitor.snapshot()["phase"] == "stopping"
+        assert monitor.active()
+        monitor.stop()
+        assert not monitor.active()
+    finally:
+        if monitor.active():
+            monitor.stop()
