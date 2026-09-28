@@ -44,7 +44,7 @@ ProviderFactory = Callable[[LLMConfig], LLMProvider]
 
 def decode_result(data: dict[str, Any]) -> ReversalResult:
     result = ReversalResult(FunctionTarget(data["address"], data["class_name"], data["function_name"]),
-                            code=data.get("code", ""), success=data.get("success", False),
+                            code=data.get("code") or "", success=data.get("success", False),
                             rounds_used=data.get("rounds_used", 0), run_id=data.get("run_id", ""),
                             error=data.get("error"))
     if data.get("verdict"):

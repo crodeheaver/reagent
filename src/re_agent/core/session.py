@@ -88,12 +88,13 @@ class Session:
 
     def record_result(self, result: ReversalResult, *, idempotent: bool = False) -> None:
         addr = normalize_address(result.target.address)
+        code = result.code or ""
         entry = {
             "address": result.target.address,
             "run_id": result.run_id,
             "error": result.error,
-            "code_sha256": hashlib.sha256(result.code.encode()).hexdigest(),
-            "code": result.code,
+            "code_sha256": hashlib.sha256(code.encode()).hexdigest(),
+            "code": code,
             "objective_verdict": result.objective_verdict.verdict.value if result.objective_verdict else None,
             "validation_checks": result.validation_verdict.checks if result.validation_verdict else [],
             "objective_findings": result.objective_verdict.findings if result.objective_verdict else [],

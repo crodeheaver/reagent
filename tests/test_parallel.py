@@ -106,6 +106,23 @@ def test_retry_limit_and_failure_independence(setup, monkeypatch):
     assert all(session.is_completed(t.address) for t in targets[1:])
 
 
+@pytest.mark.parametrize("outcome", ["empty", "raise"])
+def test_rerun_after_failed_job_without_code(setup, monkeypatch, outcome):
+    config, backend, targets, session = setup
+
+    def fake(target, *args, **kwargs):
+        if outcome == "raise":
+            raise KeyError("worker bug")
+        return ReversalResult(target, code="", success=False, error="no candidate")
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", fake)
+    assert len(reverse_parallel(targets[:2], config, backend, session, lambda c: Mock(), 4)) == 2
+    # Recovery replays the journal, including failures that never produced code.
+    rerun = Session(config.output.session_file)
+    assert reverse_parallel(targets[:2], config, backend, rerun, lambda c: Mock(), 4) == []
+    assert all(rerun.attempt_count(t.address) == 1 for t in targets[:2])
+
+
 def test_competing_coordinator_lease(setup, monkeypatch):
     config, backend, targets, session = setup
     entered, release = threading.Event(), threading.Event()
