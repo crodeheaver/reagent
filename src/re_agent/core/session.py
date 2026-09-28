@@ -57,18 +57,28 @@ class Session:
     def save(self) -> None:
         atomic_json(self.path, self._data)
 
-    def bind(self, identity: str) -> None:
-        """Archive old results when the project/evidence/acceptance policy changes."""
+    def bind(self, identity: str, acceptance: str | None = None) -> None:
+        """Archive old results when the project/evidence/acceptance policy changes.
+
+        Sessions written before acceptance identities existed adopt the current one.
+        """
         with file_lock(self.path):
             if self.path.exists():
                 self.load()
-            previous = self._data.get("identity")
-            if previous != identity and (self._data["functions"] or self._data.get("checkpoints")):
+            recorded = self._data.get("acceptance")
+            changed = self._data.get("identity") != identity or (
+                acceptance is not None and recorded is not None and recorded != acceptance)
+            if changed and (self._data["functions"] or self._data.get("checkpoints")):
                 history = self._data.get("history", [])
                 history.append({k: v for k, v in self._data.items() if k != "history"})
                 self._data = {"functions": {}, "runs": [], "history": history}
             self._data["identity"] = identity
+            if acceptance is not None:
+                self._data["acceptance"] = acceptance
             self.save()
+
+    def is_bound(self, identity: str, acceptance: str) -> bool:
+        return self._data.get("identity") == identity and self._data.get("acceptance") == acceptance
 
     def record_checkpoint(self, result: ReversalResult) -> None:
         from re_agent.reports.formatter import _result_to_dict

@@ -216,10 +216,10 @@ def reverse_class(
     session = session or Session(config.output.session_file)
     with session.coordinator():
         if config.orchestrator.max_parallel_functions > 1:
-            from re_agent.core.identity import project_fingerprint
+            from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
 
-            identity = project_fingerprint(config)
-            if session.identity != identity:
-                session.bind(identity)
+            identity, acceptance = project_fingerprint(config), acceptance_fingerprint(config)
+            if not session.is_bound(identity, acceptance):
+                session.bind(identity, acceptance)
         return _reverse_class_run(class_name, config, backend, llm, session, max_functions, checker_llm,
                                   target_addresses=target_addresses, provider_factory=provider_factory)

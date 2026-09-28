@@ -366,9 +366,11 @@ def test_library_parallel_run_rebinds_changed_semantic_identity(setup, monkeypat
     monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single",
                         lambda target, *args, **kwargs: ReversalResult(target, "ok", success=True))
     assert len(reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1)) == 1
-    original = session.identity
+    original = json.loads(session.path.read_text())["acceptance"]
+    config.llm.cli_path, config.llm.input_cost_per_million = "/opt/cli", 9.0
+    assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1) == []
     config.llm.model = "new-model"
     assert len(reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1)) == 1
-    assert original is not None and session.identity != original
+    assert json.loads(session.path.read_text())["acceptance"] != original
     assert session.attempt_count(targets[0].address) == 1
     assert len(json.loads(session.path.read_text())["history"]) == 1

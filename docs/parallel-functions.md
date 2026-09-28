@@ -81,9 +81,13 @@ retain completed rounds, previous feedback, and spent call budget. They resume
 with the remaining budget; exhaustion records a failure instead of granting free
 calls. A later attempt follows the normal attempt limit.
 
-Worker counts do not change semantic identity. Changing source, evidence, model,
-or acceptance policy invalidates incompatible accepted results. Changing other
-per-attempt execution policy can start a new parallel journal. Do not change
+Worker counts do not change semantic identity. Changing source, evidence, model
+identity (provider, model, base URL, effort), or acceptance policy invalidates
+incompatible accepted results. The session records model identity and acceptance
+policy separately from the project fingerprint, so manifests and sessions from
+earlier releases stay valid; a session without that record adopts the current one.
+Pricing metadata, CLI paths, timeouts, token limits, budgets, and concurrency never
+invalidate results, and the parallel journal survives changes to them. Do not change
 input files during a run. Keep generated sessions, journals, source proposals,
 and benchmark reports outside version control.
 

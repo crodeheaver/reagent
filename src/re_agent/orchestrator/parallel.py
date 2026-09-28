@@ -12,14 +12,14 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from re_agent.backend.protocol import REBackend
 from re_agent.config.loader import validate_config
 from re_agent.config.schema import LLMConfig, ReAgentConfig
-from re_agent.core.identity import project_fingerprint
+from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
 from re_agent.core.models import (
     CheckerVerdict,
     Finding,
@@ -133,23 +133,18 @@ def reverse_parallel(
     cancel = cancel or threading.Event()
     if limit < 1:
         raise ValueError("Function attempt limit must be positive")
-    policy = asdict(config.orchestrator)
-    for key in ("max_parallel_functions", "max_parallel_validations", "max_parallel_requests",
-                "max_functions_per_class"):
-        policy.pop(key, None)
-    models = [asdict(c) for c in (config.agents.reverser or config.llm, config.agents.checker or config.llm)]
-    for model in models:
-        model.pop("api_key", None)
     identity = identity or project_fingerprint(config)
-    key = hashlib.sha256(json.dumps([identity, str(session.path.resolve()), policy, models],
-                                   sort_keys=True).encode()).hexdigest()[:24]
+    acceptance = acceptance_fingerprint(config)
+    # Budgets and transport settings may change between runs without orphaning
+    # interrupted attempts or journaled results awaiting publication.
+    key = hashlib.sha256(json.dumps([identity, acceptance, str(session.path.resolve())]).encode()).hexdigest()[:24]
     root = Path(config.output.report_dir).resolve() / "parallel" / key
     root.mkdir(parents=True, exist_ok=True)
     from re_agent.orchestrator.execution import cancellation_signals
 
     with session.coordinator(), cancellation_signals(cancel):
-        if session.identity != identity:
-            session.bind(identity)
+        if not session.is_bound(identity, acceptance):
+            session.bind(identity, acceptance)
         return _run(targets, config, backend, session, provider_factory, limit, cancel, root, promote)
 
 
