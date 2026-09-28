@@ -36,7 +36,7 @@ def cmd_reverse(args: argparse.Namespace) -> int:
             setattr(config.orchestrator, name, value)
     validate_config(config)
 
-    from re_agent.core.identity import project_fingerprint
+    from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
     from re_agent.core.target_plan import TargetPlan
 
     plan = TargetPlan.load(Path(manifest_path)) if manifest_path else None
@@ -79,7 +79,7 @@ def cmd_reverse(args: argparse.Namespace) -> int:
                 if callable(close):
                     resources.callback(close)
             reverser_llm, checker_llm = providers
-        session.bind(project_fingerprint(config))
+        session.bind(project_fingerprint(config), acceptance_fingerprint(config))
 
         if args.address:
             from re_agent.orchestrator.single import reverse_single

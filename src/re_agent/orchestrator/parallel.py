@@ -11,15 +11,15 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from re_agent.backend.protocol import REBackend
 from re_agent.config.loader import validate_config
 from re_agent.config.schema import LLMConfig, ReAgentConfig
-from re_agent.core.identity import project_fingerprint
+from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
 from re_agent.core.models import (
     CheckerVerdict,
     Finding,
@@ -44,7 +44,7 @@ ProviderFactory = Callable[[LLMConfig], LLMProvider]
 
 def decode_result(data: dict[str, Any]) -> ReversalResult:
     result = ReversalResult(FunctionTarget(data["address"], data["class_name"], data["function_name"]),
-                            code=data.get("code", ""), success=data.get("success", False),
+                            code=data.get("code") or "", success=data.get("success", False),
                             rounds_used=data.get("rounds_used", 0), run_id=data.get("run_id", ""),
                             error=data.get("error"))
     if data.get("verdict"):
@@ -95,7 +95,11 @@ class LockedBackend:
 
 
 class WorkerSession(Session):
+    """In-memory session view for one attempt; the coordinator owns the session file."""
+
     def __init__(self, feedback: str, emit: Callable[[str, Any], None], offset: int):
+        self._lease_owner = None
+        self._data = {"functions": {}, "runs": []}
         self.feedback, self.emit, self.offset = feedback, emit, offset
 
     def previous_feedback(self, address: str) -> str:
@@ -129,23 +133,18 @@ def reverse_parallel(
     cancel = cancel or threading.Event()
     if limit < 1:
         raise ValueError("Function attempt limit must be positive")
-    policy = asdict(config.orchestrator)
-    for key in ("max_parallel_functions", "max_parallel_validations", "max_parallel_requests",
-                "max_functions_per_class"):
-        policy.pop(key, None)
-    models = [asdict(c) for c in (config.agents.reverser or config.llm, config.agents.checker or config.llm)]
-    for model in models:
-        model.pop("api_key", None)
     identity = identity or project_fingerprint(config)
-    key = hashlib.sha256(json.dumps([identity, str(session.path.resolve()), policy, models],
-                                   sort_keys=True).encode()).hexdigest()[:24]
+    acceptance = acceptance_fingerprint(config)
+    # Budgets and transport settings may change between runs without orphaning
+    # interrupted attempts or journaled results awaiting publication.
+    key = hashlib.sha256(json.dumps([identity, acceptance, str(session.path.resolve())]).encode()).hexdigest()[:24]
     root = Path(config.output.report_dir).resolve() / "parallel" / key
     root.mkdir(parents=True, exist_ok=True)
     from re_agent.orchestrator.execution import cancellation_signals
 
     with session.coordinator(), cancellation_signals(cancel):
-        if session.identity != identity:
-            session.bind(identity)
+        if not session.is_bound(identity, acceptance):
+            session.bind(identity, acceptance)
         return _run(targets, config, backend, session, provider_factory, limit, cancel, root, promote)
 
 
@@ -190,6 +189,11 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
     import psutil
 
     created = psutil.Process().create_time()
+    status_data: dict[str, Any] = {}
+
+    def write_status() -> None:
+        with suppress(PermissionError):  # Advisory status; a reader holding it must not stop the run.
+            atomic_json(status, status_data)
 
     def save(changed: str | None = None) -> None:
         if changed is not None:
@@ -197,7 +201,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         active = {v["address"] for v in jobs.values() if v["state"] in {"running", "proposed"}}
         visible = [v for v in jobs.values() if v["state"] in {"running", "proposed"}]
         visible += [v for v in jobs.values() if v["state"] not in {"running", "proposed"}][-32:]
-        atomic_json(status, {"schema_version": 1, "phase": "stopping" if cancel.is_set() else "running",
+        status_data.update({"schema_version": 1, "phase": "stopping" if cancel.is_set() else "running",
             "pid": os.getpid(), "created": created, "run_id": root.name,
             "limit": config.orchestrator.max_parallel_functions, "requests": requests.snapshot(),
             "queued": sum(a not in completed and a not in active and
@@ -206,6 +210,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
             "counts": {state: sum(v["state"] == state for v in jobs.values())
                        for state in ("running", "proposed", "completed", "failed", "interrupted")},
             "updated": time.time(), "error": failure, "stop_file": str(stop.resolve())})
+        write_status()
 
     def publish(job: str, result: ReversalResult) -> None:
         # Journal first, then idempotent session publication: recovery can finish
@@ -221,11 +226,24 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         results.append(result)
 
     for value in jobs.values():
-        if value["state"] in {"completed", "failed"}:
+        # Proposals are finished attempts whose promotion or publication a stop deferred;
+        # another target set's proposals wait for a run whose scratch project they belong to.
+        proposal = value["state"] == "proposed" and value.get("result")
+        if proposal and value["address"] not in by_address:
+            continue
+        if proposal and session.is_completed(value["address"]):
+            value["state"] = "interrupted"  # Superseded by a result accepted since the stop.
+        if value["state"] in {"completed", "failed", "proposed"} and value.get("result"):
             recovered = decode_result(value["result"])
+            changed = value["state"] == "proposed"
             if promote and recovered.success and not session.is_completed(recovered.target.address):
-                with executing(Execution(cancel, gate, lambda k, v: None)):
-                    recovered = promote(recovered, backend)
+                try:
+                    with executing(Execution(cancel, gate, lambda k, v: None)):
+                        recovered = promote(recovered, backend)
+                except Cancelled:
+                    continue
+                changed = True
+            if changed:
                 value.update(state="completed" if recovered.success else "failed", result=_result_to_dict(recovered))
                 save(value["id"])
             session.record_result_once(recovered)
@@ -256,11 +274,20 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         offset = int(snapshot.get("rounds", 0))
         isolated.orchestrator.max_review_rounds -= offset
         isolated.orchestrator.max_llm_calls_per_function -= int(snapshot.get("calls", 0))
-        if min(isolated.orchestrator.max_review_rounds, isolated.orchestrator.max_llm_calls_per_function) <= 0:
+        exhausted = min(isolated.orchestrator.max_review_rounds, isolated.orchestrator.max_llm_calls_per_function) <= 0
+        # A round this attempt already recorded is its result when it passed or no budget remains.
+        if offset and snapshot.get("checkpoint") and (snapshot["checkpoint"].get("success") or exhausted):
+            final = decode_result(snapshot["checkpoint"])
+            final.run_id = job
+            if not final.success:
+                final.error = final.error or "Interrupted attempt exhausted its saved budget"
+            return final
+        if exhausted:
             return ReversalResult(t, code="", success=False,
                                   error="Interrupted attempt exhausted its saved budget", run_id=job)
         providers: list[LLMProvider] = []
         try:
+            from re_agent.orchestrator.execution import current
             from re_agent.orchestrator.snapshot import project_snapshot
 
             with (executing(Execution(cancel, gate, lambda kind, value: emit(job, kind, value),
@@ -273,10 +300,13 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                     emit(job, "fatal", {"category": "configuration", "message": str(exc)})
                     cancel.set()
                     raise
-                feedback = json.dumps(snapshot.get("checkpoint", {}))
+                checkpoint = snapshot.get("checkpoint")
+                feedback = json.dumps(checkpoint, indent=2) if checkpoint else ""
                 result = reverse_single(t, isolated, cast(REBackend, LockedBackend(backend, backend_lock, cancel)),
                     providers[0], checker_llm=providers[1], session=WorkerSession(
                         feedback, lambda kind, value: emit(job, kind, value), offset))
+                if cast(Execution, current()).interrupted:
+                    raise Cancelled("Attempt interrupted before it finished")
                 result.rounds_used += offset
                 result.run_id = job
                 return result
@@ -297,8 +327,6 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                 if event.kind == "fatal":
                     failure = event.value
                     cancel.set()
-                    continue
-                if cancel.is_set():
                     continue
                 value = jobs[event.job]
                 if event.kind == "checkpoint":
@@ -332,31 +360,33 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                         if not future.done():
                             continue
                         job = futures.pop(future)
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                            continue
                         try:
                             result = future.result()
                         except Exception as exc:
+                            if cancel.is_set():
+                                jobs[job]["state"] = "interrupted"
+                                continue
                             result = ReversalResult(by_address[jobs[job]["address"]], code="", success=False,
                                                     error=str(exc), run_id=job)
+                        # Journal finished results so neither a stop nor a crash loses them.
                         proposed[job] = result
-                        jobs[job]["state"] = "proposed"
+                        jobs[job].update(state="proposed", result=_result_to_dict(result))
+                        save(job)
                     # Cumulative promotion follows dispatch order, never completion order.
                     for job in sorted(list(proposed), key=lambda j: jobs[j]["sequence"]):
                         if promote and any(jobs[j]["sequence"] < jobs[job]["sequence"] for j in futures.values()):
                             break
-                        result = proposed.pop(job)
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                            continue
+                        result = proposed[job]
                         if promote and result.success:
-                            with generation_lock, executing(Execution(cancel, gate, lambda k, v: None)):
-                                result = promote(result, cast(REBackend, LockedBackend(backend, backend_lock, cancel)))
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                        else:
-                            publish(job, result)
+                            # Promotion validates; after a stop the next run promotes the journaled proposal.
+                            try:
+                                with generation_lock, executing(Execution(cancel, gate, lambda k, v: None)):
+                                    result = promote(result, cast(REBackend, LockedBackend(backend, backend_lock,
+                                                                                           cancel)))
+                            except Cancelled:
+                                break
+                        del proposed[job]
+                        publish(job, result)
                     active_addresses = {jobs[j]["address"] for j in [*futures.values(), *proposed]}
                     pending = {a for a in order if a not in completed
                                and attempts.get(a, 0) < config.orchestrator.max_attempts_per_function}
@@ -378,7 +408,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                         futures[executor.submit(worker, job, copy.deepcopy(value))] = job
                         active_addresses.add(ready)
                         submitted += 1
-                    if not futures and not proposed:
+                    if not futures and (not proposed or cancel.is_set()):
                         break
                     time.sleep(.05)
             finally:
@@ -393,12 +423,11 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         watcher_done.set()
         watcher.join()
         for value in jobs.values():
-            if value["state"] in {"running", "proposed"}:
+            if value["state"] == "running" or (value["state"] == "proposed" and not value.get("result")):
                 value["state"] = "interrupted"
             if value["state"] == "interrupted":
                 save(value["id"])
         save()
-        data = json.loads(status.read_text())
-        data["phase"] = "failed" if failure else "stopped" if cancel.is_set() else "complete"
-        atomic_json(status, data)
+        status_data["phase"] = "failed" if failure else "stopped" if cancel.is_set() else "complete"
+        write_status()
     return sorted(results, key=lambda r: (rank[normalize_address(r.target.address)], jobs[r.run_id]["sequence"]))

@@ -5,13 +5,19 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
 
 class Cancelled(RuntimeError):
-    pass
+    """Raised at cancellation points; marks the calling thread's attempt as interrupted."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        context = current()
+        if context is not None:
+            context.interrupted = True
 
 
 @dataclass
@@ -21,8 +27,10 @@ class Execution:
     emit: Callable[[str, Any], None]
     requests: RequestQueue | None = None
     request_retries: int = 0
+    interrupted: bool = False
 
     def fail(self, category: str, message: str) -> None:
+        self.interrupted = True
         self.emit("fatal", {"category": category, "message": message})
         self.cancel.set()
 
@@ -75,20 +83,45 @@ def validation_lane() -> Iterator[None]:
 
 @contextmanager
 def cancellation_signals(cancel: threading.Event) -> Iterator[None]:
-    """Turn interrupt/termination into orderly shutdown on CLI main threads."""
+    """Turn interrupt/termination into orderly shutdown on CLI main threads; a second one aborts."""
     import signal
 
     if threading.current_thread() is not threading.main_thread():
         yield
         return
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    received: list[int] = []
+
+    def request(signum: int, frame: object) -> None:
+        received.append(signum)
+        if len(received) > 1:
+            _abort(signum)
+        cancel.set()
+
     try:
         for sig in previous:
-            signal.signal(sig, lambda signum, frame: cancel.set())
+            signal.signal(sig, request)
         yield
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+
+
+def _abort(signum: int) -> None:
+    """Force stop without waiting for blocked requests; journals resume interrupted attempts."""
+    import os
+    import sys
+
+    try:
+        import psutil
+
+        for child in psutil.Process().children(recursive=True):
+            with suppress(psutil.Error):
+                child.kill()
+    except Exception:  # Exiting matters more than reaping helpers.
+        pass
+    print("Forced stop; interrupted attempts resume on the next run", file=sys.stderr, flush=True)
+    os._exit(128 + signum)
 
 
 class RequestQueue:

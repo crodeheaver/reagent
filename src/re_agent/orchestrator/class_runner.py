@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -19,7 +18,7 @@ from re_agent.llm.protocol import LLMProvider
 from re_agent.orchestrator.parallel import ProviderFactory, reverse_parallel
 from re_agent.orchestrator.single import reverse_single, validate_result
 from re_agent.parity.source_indexer import SourceIndexer
-from re_agent.verification.candidate import _remap_links, create_candidate_overlay
+from re_agent.verification.candidate import copy_project_tree, create_candidate_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +152,10 @@ def _reverse_class_run(
             # Provisional successes must pass unchanged gates on the latest generation.
             result = validate_result(result, effective, view)
             if result.success:
-                _promote(result, effective)
+                try:
+                    _promote(result, effective)
+                except ValueError as exc:  # A journaled proposal must not fail every recovery.
+                    result.success, result.error = False, str(exc)
             return result
 
         assert provider_factory is not None
@@ -168,14 +170,7 @@ def _reverse_class_run(
     session = session or Session(config.output.session_file)
     with tempfile.TemporaryDirectory(prefix="re-agent-class-") as directory:
         scratch = Path(directory)
-        shutil.copytree(
-            original,
-            scratch,
-            dirs_exist_ok=True,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__", "*.coordinator.lock"),
-        )
-        _remap_links(scratch, original)
+        copy_project_tree(original, scratch, config.output.session_file)
         isolated = copy.deepcopy(config)
         isolated.validation.project_root = str(scratch)
         isolated.project_profile.source_root = str(scratch / relative_source)
@@ -216,10 +211,10 @@ def reverse_class(
     session = session or Session(config.output.session_file)
     with session.coordinator():
         if config.orchestrator.max_parallel_functions > 1:
-            from re_agent.core.identity import project_fingerprint
+            from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
 
-            identity = project_fingerprint(config)
-            if session.identity != identity:
-                session.bind(identity)
+            identity, acceptance = project_fingerprint(config), acceptance_fingerprint(config)
+            if not session.is_bound(identity, acceptance):
+                session.bind(identity, acceptance)
         return _reverse_class_run(class_name, config, backend, llm, session, max_functions, checker_llm,
                                   target_addresses=target_addresses, provider_factory=provider_factory)

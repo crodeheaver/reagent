@@ -161,6 +161,7 @@ def _validate_result(
                 Path(config.output.report_dir),
                 project_root=Path(config.validation.project_root),
                 copy_project=config.validation.copy_project,
+                state_file=config.output.session_file,
             )
             candidate_body = extract_candidate_body(result.code)
             source = indexer.analyze_body(
