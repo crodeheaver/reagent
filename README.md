@@ -410,6 +410,12 @@ POSIX execution; legacy shell strings retain their `/bin/sh` requirement. See
 [configuration](docs/configuration.md) for command forms and manifest semantics,
 and [implementation stages](docs/tooling-upgrade-plan.md) for scope and validation.
 
+## Parallel function processing
+
+Class and manifest runs support provider-independent concurrency with isolated
+workers, durable recovery, and live progress. Sequential execution remains the
+default. See [configuration and behavior](docs/parallel-functions.md).
+
 ## Configuration precedence
 
 The effective order is CLI runtime overrides, supported environment variables,
@@ -546,9 +552,3 @@ mypy src
 ## License
 
 MIT
-
-### Bounded parallel function processing
-
-Class and manifest runs support provider-independent concurrency with isolated
-workers, durable recovery, and live progress. Sequential execution remains the
-default. See [configuration and behavior](docs/parallel-functions.md).
