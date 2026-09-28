@@ -476,6 +476,24 @@ def test_source_change_invalidates_completion_but_preserves_history(tmp_path: Pa
     assert json.loads(session.path.read_text())["history"][0]["functions"]["00000100"]["success"]
 
 
+def test_acceptance_identity_is_adopted_by_older_sessions_and_tracks_models(tmp_path: Path) -> None:
+    from re_agent.core.identity import acceptance_fingerprint, project_fingerprint
+
+    config = config_for(tmp_path)
+    session = Session(tmp_path / "state.json")
+    session.bind(project_fingerprint(config))  # Written before acceptance identities existed.
+    session.record_result(ReversalResult(FunctionTarget("0x100", "", "Foo"), "old", success=True))
+    session.bind(project_fingerprint(config), acceptance_fingerprint(config))
+    assert session.is_completed("0x100") and "history" not in json.loads(session.path.read_text())
+    config.llm.timeout_s, config.llm.max_tokens, config.llm.max_budget_usd = 5, 99, 2.0
+    session.bind(project_fingerprint(config), acceptance_fingerprint(config))
+    assert session.is_completed("0x100")
+    config.llm.model = "other-model"
+    session.bind(project_fingerprint(config), acceptance_fingerprint(config))
+    assert not session.is_completed("0x100")
+    assert json.loads(session.path.read_text())["history"][0]["functions"]["00000100"]["success"]
+
+
 def test_timeout_kills_child_process(tmp_path: Path) -> None:
     import os
     import subprocess

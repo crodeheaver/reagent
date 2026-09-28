@@ -7,6 +7,7 @@ from typing import Any
 
 import anthropic
 
+from re_agent.llm.observed import sdk_retries_enabled
 from re_agent.llm.protocol import Message
 
 
@@ -31,7 +32,10 @@ class ClaudeProvider:
         temperature: float = 0.0,
         timeout_s: int = 1800,
     ) -> None:
-        self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout_s)
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout_s, max_retries=0)
+        # Sequential runs keep the SDK's transient-failure retries; parallel
+        # workers retry explicitly within call budgets (see ObservedProvider).
+        self._retrying_client = self._client.with_options(max_retries=anthropic.DEFAULT_MAX_RETRIES)
         self.last_metadata: dict[str, Any] = {}
         self._model = model
         self._max_tokens = max_tokens
@@ -39,6 +43,12 @@ class ClaudeProvider:
         self._conversations: dict[str, list[Message]] = {}
 
     # -- LLMProvider interface ------------------------------------------------
+
+    def close(self) -> None:
+        self._client.close()
+
+    def _request_client(self) -> anthropic.Anthropic:
+        return self._retrying_client if sdk_retries_enabled() else self._client
 
     def send(self, messages: list[Message], **kwargs: Any) -> str:
         """Send messages to Claude and return the assistant response text."""
@@ -60,7 +70,7 @@ class ClaudeProvider:
         if system_text is not None:
             create_kwargs["system"] = system_text
 
-        response = self._client.messages.create(**create_kwargs)
+        response = self._request_client().messages.create(**create_kwargs)
 
         usage = getattr(response, "usage", None)
         self.last_metadata = {"model": self._model, "usage": usage.model_dump() if usage is not None else {}}
@@ -89,7 +99,8 @@ class ClaudeProvider:
         if history is None:
             raise KeyError(f"Unknown conversation ID: {conversation_id}")
 
-        history.append(Message(role="user", content=message))
-        response_text = self.send(list(history))
-        history.append(Message(role="assistant", content=response_text))
+        # Commit the turn only after a response, so a failed attempt can be retried.
+        user_message = Message(role="user", content=message)
+        response_text = self.send([*history, user_message])
+        history.extend([user_message, Message(role="assistant", content=response_text)])
         return response_text

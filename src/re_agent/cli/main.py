@@ -15,6 +15,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", help="Available commands")
 
+    monitor_p = sub.add_parser("monitor", help="Host a local live progress dashboard")
+    monitor_p.add_argument("--work-dir", default=".", help="Directory containing run sessions")
+    monitor_p.add_argument("--state-dir", default="reports/monitor", help="Monitor control state and worker logs")
+    monitor_p.add_argument("--session-glob", action="append", help="Relative session pattern (repeatable)")
+    monitor_p.add_argument("--log-glob", help="Relative activity-log pattern; shows most recently modified log")
+    monitor_p.add_argument("--total", type=int, default=0, help="Planned function count; 0 means unknown")
+    monitor_p.add_argument("--port", type=int, default=8765)
+    monitor_p.add_argument("--progress-file",
+                           help="Relative progress JSON written by an external batch runner (not by re-agent)")
+    monitor_p.add_argument("--stop-file", help="Relative cooperative stop file for the external runner")
+    monitor_p.add_argument("--event-glob",
+                           help="Relative pattern for native Grok JSONL event logs kept by an external batch runner")
+    monitor_p.add_argument("--worker", nargs=argparse.REMAINDER, help="Optional worker argv; must be the last option")
+
     doctor_p = sub.add_parser("doctor", help="Check configuration and exported evidence without LLM calls")
     doctor_p.add_argument("--address", help="Check evidence for one function")
     benchmark_p = sub.add_parser("benchmark", help="Run a differential harness manifest")
@@ -41,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     rev_p.add_argument("--manifest", help="Target manifest produced by plan")
     rev_p.add_argument("--address", help="Single function address to reverse")
     rev_p.add_argument("--class", dest="class_name", help="Class name for class-level reversal")
+    rev_p.add_argument("--function", dest="function_name", help="Function name for single-address reversal")
     rev_p.add_argument("--max-functions", type=int, default=None, help="Max functions per class")
+    rev_p.add_argument("--max-parallel-functions", type=int, default=None, help="Concurrent functions (1-32)")
+    rev_p.add_argument("--max-parallel-requests", type=int, default=None, help="Concurrent model requests (1-32)")
+    rev_p.add_argument("--max-parallel-validations", type=int, default=None, help="Concurrent isolated validations")
     rev_p.add_argument("--max-rounds", type=int, default=None, help="Max review rounds per function")
     rev_p.add_argument("--dry-run", action="store_true", help="Show plan without executing")
     rev_p.add_argument("--skip-parity", action="store_true", help="Skip parity check after PASS")
@@ -77,6 +95,11 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "monitor":
+        from re_agent.cli.cmd_monitor import cmd_monitor
+
+        return cmd_monitor(args)
 
     if args.command == "evidence":
         from re_agent.cli.cmd_evidence import cmd_evidence

@@ -243,6 +243,23 @@ Claude CLI supports real session resume and reports usage/cost metadata. A
 stale CLI login can still require re-authentication even when its auth-status
 command reports a session.
 
+### Grok Build CLI
+
+Authenticate with `grok login`, then configure:
+
+```yaml
+llm:
+  provider: grok-cli
+  model: "" # Use Grok Build's configured model, or specify a model ID.
+  cli_path: grok
+  timeout_s: 600
+```
+
+Supports native session resume, JSON response validation, usage metadata,
+and tool-free requests from an isolated working directory. Large evidence
+prompts use temporary files. See [Grok Build configuration](docs/grok-build.md)
+for supported settings and limits.
+
 ### OpenAI-compatible APIs
 
 ```yaml
@@ -352,6 +369,7 @@ Global options must precede the subcommand, for example
 |---|---|
 | `re-agent init --profile generic-cpp` | Create `re-agent.yaml` from a profile |
 | `re-agent reverse --address ADDR` | Reverse one function |
+| `re-agent reverse --address ADDR --class CLASS --function NAME` | Reverse one function with known source identity |
 | `re-agent reverse --class CLASS --max-functions N` | Reverse a bounded class batch |
 | `re-agent reverse --class CLASS --dry-run` | Show a target plan without LLM calls |
 | `re-agent reverse ... --max-rounds N --skip-parity` | Override loop/parity behavior |
@@ -361,8 +379,12 @@ Global options must precede the subcommand, for example
 | `re-agent status --class CLASS --format text` | Show session progress |
 | `re-agent estimate --address ADDR` | Estimate one function |
 | `re-agent estimate --class CLASS --limit N` | Estimate a class batch |
+| `re-agent monitor --work-dir DIR --total N` | Serve a local live progress dashboard |
 
 Use `re-agent <command> --help` for the exact option list.
+
+For the dashboard and its optional worker start/stop controls, see the
+[live monitor guide](docs/live-monitor.md).
 
 ## Working with function groups
 
@@ -387,6 +409,12 @@ Build/test/runtime commands also accept argument arrays for native Windows and
 POSIX execution; legacy shell strings retain their `/bin/sh` requirement. See
 [configuration](docs/configuration.md) for command forms and manifest semantics,
 and [implementation stages](docs/tooling-upgrade-plan.md) for scope and validation.
+
+## Parallel function processing
+
+Class and manifest runs support provider-independent concurrency with isolated
+workers, durable recovery, and live progress. Sequential execution remains the
+default. See [configuration and behavior](docs/parallel-functions.md).
 
 ## Configuration precedence
 

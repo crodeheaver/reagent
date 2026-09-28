@@ -14,6 +14,17 @@ from re_agent.config.schema import ValidationConfig
 from re_agent.core.models import FunctionTarget, SourceMatch, ValidationVerdict, Verdict
 from re_agent.utils.process import run_process
 
+_NON_CODE = re.compile(
+    r'//[^\n]*|/\*[\s\S]*?\*/|R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})\([\s\S]*?\)(?P=delimiter)"'
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+)
+
+
+def unresolved_placeholders(code: str) -> list[str]:
+    """Find executable unrecovered-jump placeholders, ignoring comments/literals."""
+    tokens = _NON_CODE.sub(" ", code)
+    return sorted(set(re.findall(r"\bUNRECOVERED_JUMPTABLE(?:_\w+)?\b", tokens)))
+
 
 def extract_candidate_body(code: str) -> str:
     """Extract the outer C++ body from generated code."""
@@ -30,6 +41,25 @@ def extract_candidate_body(code: str) -> str:
     return code[open_brace : close_brace + 1].strip()
 
 
+def copy_project_tree(source: Path, destination: Path, state_file: str | Path | None = None) -> None:
+    """Copy a project without ReAgent's live state, tolerating files deleted mid-copy."""
+    state = ["*.coordinator.lock", "*.json.lock", "*.json.*.tmp", "*.json.execution.json", "*.execution.stop"]
+    if state_file:
+        state.append(Path(state_file).name + "*")  # Session, lock, status, stop and temp files.
+
+    def copy_present(src: str, dst: str) -> object:
+        try:
+            return shutil.copy2(src, dst)
+        except FileNotFoundError:
+            if os.path.lexists(src):
+                raise
+            return dst
+
+    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True, copy_function=copy_present,
+                    ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__", "*.pyc", *state))
+    _remap_links(destination, source)
+
+
 def create_candidate_overlay(
     target: FunctionTarget,
     code: str,
@@ -38,6 +68,7 @@ def create_candidate_overlay(
     report_dir: Path,
     project_root: Path | None = None,
     copy_project: bool = False,
+    state_file: str | Path | None = None,
 ) -> Path:
     """Write a source overlay with the original function body replaced."""
     safe_address = _sanitize_path_component(target.address)
@@ -47,14 +78,7 @@ def create_candidate_overlay(
             if project_root is None:
                 raise ValueError("project_root is required when copy_project is enabled")
             overlay_root = Path(tempfile.mkdtemp(prefix=f"re-agent-{safe_address}-"))
-            shutil.copytree(
-                project_root,
-                overlay_root,
-                dirs_exist_ok=True,
-                symlinks=True,
-                ignore=shutil.ignore_patterns(".git", ".venv", "build", "reports", "__pycache__", "*.pyc"),
-            )
-            _remap_links(overlay_root, project_root)
+            copy_project_tree(project_root, overlay_root, state_file)
         else:
             overlay_root = report_dir / "candidates" / safe_address
         overlay_root.mkdir(parents=True, exist_ok=True)
@@ -170,8 +194,13 @@ def validate_candidate(
         except subprocess.TimeoutExpired:
             checks.append({"kind": kind, "verdict": "FAIL", "detail": "timed out"})
             return _failed(f"{kind} command timed out: {command}", candidate_file, findings, checks)
-        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-20:])
-        findings.append(f"{kind}: {command} -> exit {proc.returncode}\n{tail}".rstrip())
+        # First errors often explain cascades of missing types/declarations.
+        # Keep them alongside the final summary, prioritizing compiler stderr.
+        lines = (proc.stderr + "\n" + proc.stdout).strip().splitlines()
+        if len(lines) > 20:
+            lines = [*lines[:10], "[intermediate output omitted]", *lines[-10:]]
+        excerpt = "\n".join(line[:500] for line in lines)
+        findings.append(f"{kind}: {command} -> exit {proc.returncode}\n{excerpt}".rstrip())
         checks.append({"kind": kind, "verdict": "PASS" if proc.returncode == 0 else "FAIL",
                        "detail": f"exit {proc.returncode}"})
         if proc.returncode != 0:

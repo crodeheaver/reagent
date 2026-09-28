@@ -19,6 +19,8 @@ def project_fingerprint(config: ReAgentConfig) -> str:
         "parity": asdict(config.parity),
         "backend": asdict(config.backend),
     }
+    # Execution-only settings must not change identities recorded by earlier releases.
+    values["validation"].pop("parallel_safe", None)
     digest.update(json.dumps(values, sort_keys=True).encode())
     root = Path(config.project_profile.source_root).resolve()
     digest.update(str(root).encode())
@@ -41,3 +43,17 @@ def project_fingerprint(config: ReAgentConfig) -> str:
         if value:
             digest.update(Path(value).read_bytes())
     return digest.hexdigest()
+
+
+def acceptance_fingerprint(config: ReAgentConfig) -> str:
+    """Identify the models and acceptance policy that produced accepted results.
+
+    Only model identity counts; pricing, CLI paths, timeouts, token limits and
+    budgets change how a model is run, not what an accepted result means.
+    """
+    models = {role: {key: getattr(model, key) for key in ("provider", "model", "base_url", "effort")}
+              for role, model in (("reverser", config.agents.reverser or config.llm),
+                                  ("checker", config.agents.checker or config.llm))}
+    policy = {key: value for key, value in asdict(config.orchestrator).items()
+              if key.startswith("objective_") or key == "cumulative_validation"}
+    return hashlib.sha256(json.dumps({"models": models, "policy": policy}, sort_keys=True).encode()).hexdigest()

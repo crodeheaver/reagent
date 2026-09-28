@@ -9,6 +9,12 @@ from re_agent.backend.protocol import REBackend
 from re_agent.core.models import FunctionTarget, ObjectiveVerdict, Verdict
 from re_agent.utils.text import count_calls, count_control_flow, strip_comments
 
+# Listing lines start with an address: 0x-prefixed, or bare hex containing a
+# decimal digit so mnemonics such as ADD, ADC, DEC or FADD are not read as one.
+_ASM_ADDRESS = re.compile(r"(?m)^\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]*[0-9][0-9a-fA-F]*)\s+")
+_TRUNCATION_MARKER = re.compile(r"(?im)^\s*(?:\.\.\.|.*\btruncated\b)")
+_MAX_INSTRUCTION_BYTES = 16
+
 
 def verify_candidate(
     code: str,
@@ -31,6 +37,8 @@ def verify_candidate(
 
     findings: list[str] = []
     checks_run = 0
+    asm = None
+    scope_conflict: str | None = None
 
     try:
         decompile = backend.decompile(target.address)
@@ -111,7 +119,12 @@ def verify_candidate(
         pcode = _read_ir_artifact(backend, "get_pcode", target.address)
         if isinstance(pcode, list):
             pcode = [item for item in pcode if isinstance(item, dict) and item.get("opcode")]
-        if isinstance(pcode, list) and pcode:
+        if isinstance(pcode, list) and pcode and asm is not None:
+            scope_conflict = _ir_scope_conflict(asm.instructions, pcode)
+        # IR that covers other instructions than the listing (expanded tail
+        # targets, incomplete exports) cannot establish a candidate mismatch;
+        # skip that comparison rather than failing or repairing the candidate.
+        if isinstance(pcode, list) and pcode and scope_conflict is None:
             checks_run += 1
             opcodes = [str(item.get("opcode", "")).upper() for item in pcode if isinstance(item, dict)]
             ir_calls = sum(op in {"CALL", "CALLIND"} for op in opcodes)
@@ -126,23 +139,47 @@ def verify_candidate(
                     f"P-code return mismatch: normalized IR has {ir_returns} returns, candidate has no explicit return"
                 )
 
+    note = f"; p-code comparison skipped: {scope_conflict}" if scope_conflict else ""
+    conflict = scope_conflict is not None
     if findings:
         return ObjectiveVerdict(
             verdict=Verdict.FAIL,
-            summary="Objective verifier found structural mismatches",
+            summary="Objective verifier found structural mismatches" + note,
             findings=findings,
+            evidence_conflict=conflict,
         )
     if checks_run == 0:
         return ObjectiveVerdict(
             verdict=Verdict.UNKNOWN,
-            summary="Objective verifier had insufficient structural data",
+            summary="Objective verifier had insufficient structural data" + note,
             findings=[],
+            evidence_conflict=conflict,
         )
     return ObjectiveVerdict(
         verdict=Verdict.PASS,
-        summary="No structural mismatches found",
+        summary="No structural mismatches found" + note,
         findings=[],
+        evidence_conflict=conflict,
     )
+
+
+def _ir_scope_conflict(listing: str, pcode: list[dict[str, object]]) -> str | None:
+    """Describe p-code instructions missing from a complete assembly listing."""
+    listed = {int(address, 16) for address in _ASM_ADDRESS.findall(listing)}
+    ir_addresses = {
+        int(str(item["address"]), 16) for item in pcode
+        if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", str(item.get("address", "")))
+    }
+    outside = ir_addresses - listed
+    if not listed or not outside:
+        return None
+    # A listing that stops early (explicit marker, or IR resuming right after the
+    # last listed instruction) is incomplete evidence, not a different scope.
+    resumes_after_end = 0 < min(outside) - max(listed) <= _MAX_INSTRUCTION_BYTES
+    if _TRUNCATION_MARKER.search(listing) or resumes_after_end:
+        return None
+    return (f"evidence scopes differ ({len(outside)} p-code instruction addresses absent from the assembly, "
+            f"first: {min(outside):x})")
 
 
 def _extract_body(text: str) -> str:

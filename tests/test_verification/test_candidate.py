@@ -183,3 +183,52 @@ def test_copy_project_builds_against_isolated_candidate(tmp_path: Path) -> None:
     overlay_root = candidate.parents[1]
     cleanup_candidate_overlay(candidate)
     assert not overlay_root.exists()
+
+
+def test_project_copy_skips_live_session_state(tmp_path: Path) -> None:
+    from re_agent.verification.candidate import copy_project_tree
+
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    kept = ["src/f.cpp", "Cargo.lock", "notes.execution.json"]
+    state = ["progress.json", "progress.json.lock", "progress.json.execution.json", "progress.json.execution.stop",
+             "progress.json.k2x9a1bq.tmp", "progress.json.execution.json.p0q9z8ab.tmp", "progress.coordinator.lock"]
+    for name in [*kept, *state]:
+        (project / name).write_text("x", encoding="utf-8")
+    copy_project_tree(project, tmp_path / "copy", project / "progress.json")
+    copied = {p.relative_to(tmp_path / "copy").as_posix() for p in (tmp_path / "copy").rglob("*") if p.is_file()}
+    assert copied == set(kept)
+    candidate = create_candidate_overlay(FunctionTarget("0x1", "C", "f"), "int f() { return 1; }", None,
+                                         project / "src", tmp_path / "reports", project, True, "progress.json")
+    try:
+        assert not any(candidate.parent.glob("progress*"))
+    finally:
+        cleanup_candidate_overlay(candidate)
+
+
+def test_project_copy_tolerates_vanished_files_but_not_other_errors(tmp_path: Path, monkeypatch) -> None:
+    import shutil
+
+    from re_agent.verification.candidate import copy_project_tree
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "f.cpp").write_text("int f();", encoding="utf-8")
+    (project / "editor.tmp").write_text("x", encoding="utf-8")
+    copy2 = shutil.copy2
+
+    def racing(src, dst, **kwargs):
+        if Path(src).name == "editor.tmp":
+            Path(src).unlink()  # Deleted by another process after the directory listing.
+        return copy2(src, dst, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", racing)
+    copy_project_tree(project, tmp_path / "copy")
+    assert [p.name for p in (tmp_path / "copy").iterdir()] == ["f.cpp"]
+
+    def broken(src, dst, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", dst)
+
+    monkeypatch.setattr(shutil, "copy2", broken)
+    with pytest.raises(shutil.Error):
+        copy_project_tree(project, tmp_path / "again")

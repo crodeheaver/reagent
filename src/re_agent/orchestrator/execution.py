@@ -1,0 +1,171 @@
+"""Thread-local execution controls shared by providers and validation gates."""
+from __future__ import annotations
+
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from typing import Any
+
+
+class Cancelled(RuntimeError):
+    """Raised at cancellation points; marks the calling thread's attempt as interrupted."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        context = current()
+        if context is not None:
+            context.interrupted = True
+
+
+@dataclass
+class Execution:
+    cancel: threading.Event
+    validations: threading.Semaphore
+    emit: Callable[[str, Any], None]
+    requests: RequestQueue | None = None
+    request_retries: int = 0
+    interrupted: bool = False
+
+    def fail(self, category: str, message: str) -> None:
+        self.interrupted = True
+        self.emit("fatal", {"category": category, "message": message})
+        self.cancel.set()
+
+    def check(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled("Execution cancelled")
+
+
+_local = threading.local()
+
+
+def current() -> Execution | None:
+    return getattr(_local, "execution", None)
+
+
+@contextmanager
+def executing(context: Execution) -> Iterator[None]:
+    previous = current()
+    _local.execution = context
+    try:
+        context.check()
+        yield
+    finally:
+        _local.execution = previous
+
+
+def progress(stage: str) -> None:
+    context = current()
+    if context:
+        context.check()
+        context.emit("stage", stage)
+
+
+@contextmanager
+def validation_lane() -> Iterator[None]:
+    context = current()
+    if context is None:
+        yield
+        return
+    progress("waiting-for-validation")
+    while not context.validations.acquire(timeout=.1):
+        context.check()
+    try:
+        progress("validating")
+        yield
+        context.check()
+    finally:
+        context.validations.release()
+
+
+@contextmanager
+def cancellation_signals(cancel: threading.Event) -> Iterator[None]:
+    """Turn interrupt/termination into orderly shutdown on CLI main threads; a second one aborts."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    received: list[int] = []
+
+    def request(signum: int, frame: object) -> None:
+        received.append(signum)
+        if len(received) > 1:
+            _abort(signum)
+        cancel.set()
+
+    try:
+        for sig in previous:
+            signal.signal(sig, request)
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _abort(signum: int) -> None:
+    """Force stop without waiting for blocked requests; journals resume interrupted attempts."""
+    import os
+    import sys
+
+    try:
+        import psutil
+
+        for child in psutil.Process().children(recursive=True):
+            with suppress(psutil.Error):
+                child.kill()
+    except Exception:  # Exiting matters more than reaping helpers.
+        pass
+    print("Forced stop; interrupted attempts resume on the next run", file=sys.stderr, flush=True)
+    os._exit(128 + signum)
+
+
+class RequestQueue:
+    """FIFO admission and shared rate-limit cooldown, independent of function slots."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+        self.waiting: deque[object] = deque()
+        self.condition = threading.Condition()
+        self.ready_at = 0.0
+
+    def snapshot(self) -> dict[str, int]:
+        with self.condition:
+            return {"limit": self.limit, "active": self.active, "queued": len(self.waiting)}
+
+    def defer(self, seconds: float) -> None:
+        with self.condition:
+            self.ready_at = max(self.ready_at, time.monotonic() + min(60, max(0, seconds)))
+            self.condition.notify_all()
+
+    @contextmanager
+    def acquire(self, context: Execution) -> Iterator[float]:
+        ticket = object()
+        start = time.monotonic()
+        with self.condition:
+            self.waiting.append(ticket)
+            try:
+                while True:
+                    context.check()
+                    if (self.waiting[0] is ticket and self.active < self.limit and
+                            time.monotonic() >= self.ready_at):
+                        self.waiting.popleft()
+                        self.active += 1
+                        self.condition.notify_all()
+                        break
+                    self.condition.wait(.1)
+            except BaseException:
+                self.waiting.remove(ticket)
+                self.condition.notify_all()
+                raise
+        try:
+            yield time.monotonic() - start
+        finally:
+            with self.condition:
+                self.active -= 1
+                self.condition.notify_all()

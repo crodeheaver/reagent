@@ -70,7 +70,10 @@ def run_process(
     import os
     import signal
     import tempfile
+    import threading
 
+    if input_text:
+        input_text.encode("utf-8")  # Fail before starting a child that would see truncated input.
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         proc = subprocess.Popen(
             list(args),
@@ -80,11 +83,58 @@ def run_process(
             stdout=stdout,
             stderr=stderr,
             text=True,
+            encoding="utf-8",
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
             start_new_session=os.name != "nt",
         )
+        stdin = proc.stdin
+        assert stdin is not None
+
+        def feed() -> None:
+            try:
+                stdin.write(input_text or "")
+            except OSError:
+                pass  # The child exited or was killed before reading all input.
+            finally:
+                with contextlib.suppress(OSError):
+                    stdin.close()
+
+        # Feed stdin from a thread: communicate() cannot resume a partial write
+        # after the short polling timeouts that keep cancellation responsive.
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
         try:
-            proc.communicate(input_text, timeout=timeout_s)
+            import time
+
+            from re_agent.orchestrator.execution import current
+
+            context = current()
+            deadline = time.monotonic() + timeout_s
+            while True:
+                if context:
+                    context.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout_s)
+                try:
+                    proc.wait(timeout=min(.1, remaining) if context else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if not context:
+                        raise
         except BaseException:
+            # Capture descendants before killing their parent, including children
+            # that have detached into a separate POSIX session.
+            try:
+                import psutil
+
+                with contextlib.suppress(psutil.Error):
+                    descendants = psutil.Process(proc.pid).children(recursive=True)
+                    for child in reversed(descendants):
+                        with contextlib.suppress(psutil.Error):
+                            child.kill()
+            except ImportError:
+                pass
             if os.name == "nt":
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
             else:
@@ -92,6 +142,8 @@ def run_process(
                     os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
             raise
+        finally:
+            feeder.join(timeout=1)
 
         def read_tail(handle: object) -> str:
             # Temporary files bound memory even when a build emits a large log.
