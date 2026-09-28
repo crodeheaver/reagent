@@ -110,9 +110,9 @@ Stop first closes dispatch and requests cooperative cleanup. Waiting jobs and
 local subprocesses observe cancellation. Attempts that finished are still
 published; a successful proposal whose cumulative promotion a stop interrupts stays
 journaled for the next run.
-Synchronous API calls finish or reach their configured transport timeout. SDK
-retries are disabled so they cannot silently spend calls beyond the recorded
-budget. The monitor shows Stopping during cleanup; **Force stop** terminates the
+Synchronous API calls finish or reach their configured transport timeout. In
+parallel workers SDK retries are disabled so they cannot silently spend calls
+beyond the recorded budget; sequential runs keep the SDK's default retries. The monitor shows Stopping during cleanup; **Force stop** terminates the
 owned process tree when a request is unresponsive. Ctrl+C/SIGTERM also request
 orderly shutdown in parallel CLI runs. The CLI returns 130 after cancellation. A
 second Ctrl+C/SIGTERM forces the stop: it kills the run's child processes and exits
