@@ -345,3 +345,84 @@ def test_parallel_stop_requests_cleanup_then_force_stops(tmp_path):
     finally:
         if monitor.active():
             monitor.stop()
+
+
+def test_vanishing_event_log_does_not_break_snapshot(tmp_path, monkeypatch):
+    (tmp_path / "b1").mkdir()
+    (tmp_path / "b1" / "native.jsonl").write_text('{"type":"text","data":"x"}\n')
+    monitor = Monitor(tmp_path, tmp_path / "state", [], event_glob="*/native.jsonl")
+    assert monitor.snapshot()["agents"][0]["text"] == "x"
+
+    def vanished(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(monitor.agent_events, "read", vanished)
+    state = monitor.snapshot()
+    assert state["event_sources"] == ["b1/native.jsonl"]
+    assert state["agents"][0]["text"] == "x"
+
+
+def test_http_errors_are_answered_not_dropped(http_monitor, monkeypatch):
+    monitor, url = http_monitor
+    with urllib.request.urlopen(url) as response:
+        token = re.search(r'const token = "([^"]+)"', response.read().decode()).group(1)
+
+    def failing(*_args):
+        raise psutil.NoSuchProcess(1)
+
+    monkeypatch.setattr(monitor, "snapshot", failing)
+    monkeypatch.setattr(monitor, "stop", failing)
+    requests = [urllib.request.Request(url + "/api/status", headers={"X-Control-Token": token}),
+                urllib.request.Request(url + "/api/stop", method="POST", headers={"X-Control-Token": token})]
+    for request in requests:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code in (400, 503)
+        assert "error" in json.load(error.value)
+
+
+def test_history_source_vanishing_mid_read_is_answered(tmp_path, monkeypatch):
+    from re_agent.monitor.events import AgentEvents
+
+    (tmp_path / "gone.jsonl").write_text('{"type":"text","data":"x"}\n')
+    monitor = Monitor(tmp_path, tmp_path / "state", [], event_glob="*.jsonl")
+    server = make_server(monitor, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(base) as response:
+            token = re.search(r'const token = "([^"]+)"', response.read().decode()).group(1)
+
+        def vanished(self, path):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(AgentEvents, "read", vanished)
+        request = urllib.request.Request(base + "/api/agent-history?source=gone.jsonl",
+                                         headers={"X-Control-Token": token})
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal path")
+def test_stop_reports_a_worker_that_will_not_exit(tmp_path, monkeypatch):
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "import time; time.sleep(60)"])
+    monitor.start()
+    process = monitor.process
+    try:
+        def never(timeout=None):
+            raise psutil.TimeoutExpired(timeout, process.pid)
+
+        monkeypatch.setattr(monitor, "_adopt", lambda: None)
+        monkeypatch.setattr(monitor, "process", psutil.Process(process.pid))
+        monkeypatch.setattr(monitor.process, "wait", never)
+        with pytest.raises(RuntimeError, match="did not exit"):
+            monitor.stop()
+    finally:
+        process.kill()
+        process.wait(timeout=10)

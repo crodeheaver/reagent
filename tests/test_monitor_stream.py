@@ -156,3 +156,32 @@ def test_rewritten_or_replaced_source_restarts_the_view(tmp_path):
     replacement.write_text(text_lines("Y" * 300, "C" * 40, "D"))  # identical head, different file
     os.replace(replacement, path)
     assert reader.read(path)[0]["text"] == "Y" * 300 + "C" * 40 + "D"
+
+
+def test_stream_closes_cleanly_when_state_is_unavailable(tmp_path, monkeypatch):
+    monitor = Monitor(tmp_path, tmp_path / "state", [])
+    server = make_server(monitor, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host = f"127.0.0.1:{server.server_port}"
+
+    def failing():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(monitor, "snapshot", failing)
+    ws = WSConnection(ConnectionType.CLIENT)
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            sock.sendall(ws.send(Request(host=host, target="/api/stream",
+                                         extra_headers=[(b"Origin", f"http://{host}".encode())])))
+            events = []
+            while not any(isinstance(event, CloseConnection) for event in events):
+                data = sock.recv(65536)
+                assert data, "connection dropped without a close frame"
+                ws.receive_data(data)
+                events += list(ws.events())
+            assert [e.code for e in events if isinstance(e, CloseConnection)] == [1011]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
