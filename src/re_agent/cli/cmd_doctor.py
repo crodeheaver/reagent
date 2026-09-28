@@ -9,6 +9,7 @@ from pathlib import Path
 
 from re_agent.backend.registry import create_backend
 from re_agent.config.loader import load_config
+from re_agent.llm.registry import CLI_EXECUTABLES
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -23,8 +24,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ("reverser", config.agents.reverser or config.llm),
         ("checker", config.agents.checker or config.llm),
     ):
-        if model.provider in {"claude-cli", "codex"}:
-            executable = model.cli_path or ("claude" if model.provider == "claude-cli" else "codex")
+        if model.provider in CLI_EXECUTABLES:
+            executable = model.cli_path or CLI_EXECUTABLES[model.provider]
             add(role + " executable", shutil.which(executable) is not None, executable)
     validation = config.validation
     commands = validation.build_commands + validation.test_commands + validation.runtime_commands

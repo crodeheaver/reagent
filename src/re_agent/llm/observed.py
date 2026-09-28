@@ -12,6 +12,17 @@ from typing import Any
 from re_agent.llm.protocol import LLMProvider, Message
 
 
+def sdk_retries_enabled() -> bool:
+    """Whether API SDKs should retry transient failures for the current call.
+
+    Execution contexts (parallel workers) own explicit, budgeted retries in
+    :class:`ObservedProvider`; sequential runs keep the SDK's own retries.
+    """
+    from re_agent.orchestrator.execution import current
+
+    return current() is None
+
+
 @dataclass
 class CallBudget:
     limit: int

@@ -7,6 +7,7 @@ from typing import Any
 
 import openai
 
+from re_agent.llm.observed import sdk_retries_enabled
 from re_agent.llm.protocol import Message
 
 
@@ -38,6 +39,9 @@ class OpenAIProvider:
         base_url: str | None = None,
     ) -> None:
         self._client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_s, max_retries=0)
+        # Sequential runs keep the SDK's transient-failure retries; parallel
+        # workers retry explicitly within call budgets (see ObservedProvider).
+        self._retrying_client = self._client.with_options(max_retries=openai.DEFAULT_MAX_RETRIES)
         self.last_metadata: dict[str, Any] = {}
         self._model = model
         self._max_tokens = max_tokens
@@ -49,11 +53,14 @@ class OpenAIProvider:
     def close(self) -> None:
         self._client.close()
 
+    def _request_client(self) -> openai.OpenAI:
+        return self._retrying_client if sdk_retries_enabled() else self._client
+
     def send(self, messages: list[Message], **kwargs: Any) -> str:
         """Send messages via the chat completions API and return the response."""
         api_messages: list[dict[str, str]] = [{"role": m.role, "content": m.content} for m in messages]
 
-        response = self._client.chat.completions.create(
+        response = self._request_client().chat.completions.create(
             model=kwargs.get("model", self._model),
             messages=api_messages,  # type: ignore[arg-type]
             max_tokens=kwargs.get("max_tokens", self._max_tokens),
@@ -83,7 +90,8 @@ class OpenAIProvider:
         if history is None:
             raise KeyError(f"Unknown conversation ID: {conversation_id}")
 
-        history.append(Message(role="user", content=message))
-        response_text = self.send(list(history))
-        history.append(Message(role="assistant", content=response_text))
+        # Commit the turn only after a response, so a failed attempt can be retried.
+        user_message = Message(role="user", content=message)
+        response_text = self.send([*history, user_message])
+        history.extend([user_message, Message(role="assistant", content=response_text)])
         return response_text

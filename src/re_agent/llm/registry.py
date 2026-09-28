@@ -5,6 +5,9 @@ from __future__ import annotations
 from re_agent.config.schema import LLMConfig
 from re_agent.llm.protocol import LLMProvider
 
+# Providers that run a local CLI, with the executable used when cli_path is unset.
+CLI_EXECUTABLES = {"claude-cli": "claude", "codex": "codex", "grok-cli": "grok"}
+
 
 def create_provider(config: LLMConfig) -> LLMProvider:
     """Instantiate an LLM provider from a configuration object.
