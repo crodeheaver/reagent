@@ -28,6 +28,9 @@ from re_agent.parity.source_indexer import SourceIndexer
 from re_agent.verification.candidate import extract_candidate_body, unresolved_placeholders
 from re_agent.verification.objective import verify_candidate
 
+_SHAPE_FIX = "Return exactly one complete function definition without helper definitions."
+_EVIDENCE_FIX = "Resolve the reported issue using binary evidence; do not invent declarations for unknown targets."
+
 
 def run_fix_loop(
     target: FunctionTarget,
@@ -132,35 +135,36 @@ def run_fix_loop(
 
         # Avoid spending a reviewer call on output the configured candidate gate
         # cannot consume. Keep the same repair/checkpoint path as other failures.
-        preflight_error = None
+        preflight_issues: list[str] = []
+        fix_instruction = _EVIDENCE_FIX
         if candidate_gate is not None:
             try:
                 extract_candidate_body(code)
             except ValueError as exc:
-                preflight_error = str(exc)
+                preflight_issues = [str(exc)]
+                fix_instruction = _SHAPE_FIX
         placeholders = unresolved_placeholders(code)
         if placeholders:
-            preflight_error = "Unresolved decompiler placeholders: " + ", ".join(placeholders)
-        if not preflight_error and candidate_preflight is not None:
+            preflight_issues = ["Unresolved decompiler placeholders: " + ", ".join(placeholders)]
+            fix_instruction = _EVIDENCE_FIX
+        if not preflight_issues and candidate_preflight is not None:
             checked = candidate_preflight(ReversalResult(
                 target=target, code=code, success=True, rounds_used=round_num, run_id=run_id,
             ))
-            if not checked.success:
-                details = []
-                if checked.validation_verdict:
-                    details = [checked.validation_verdict.summary, *checked.validation_verdict.findings]
-                details.extend(f.reason for f in checked.parity_findings)
-                preflight_error = "Local validation preflight failed: " + "; ".join(details)
-        if preflight_error:
+            # Skip review only when the local gate rejected this candidate itself: a
+            # gate failed, or it passed but parity policy rejected it. UNKNOWN (no or
+            # untrusted commands) is a configuration outcome that review cannot change.
+            verdict_kind = checked.validation_verdict.verdict if checked.validation_verdict else None
+            if not checked.success and verdict_kind in (Verdict.FAIL, Verdict.PASS):
+                preflight_issues = _gate_issues(checked)
+        if preflight_issues:
             checker.last_prompt = ""
             checker.last_response = ""
             verdict = CheckerVerdict(
                 verdict=Verdict.FAIL,
                 summary="Local candidate preflight failed; model review skipped",
-                issues=[preflight_error],
-                fix_instructions=[
-                    "Resolve the reported issue using binary evidence; do not invent declarations for unknown targets."
-                ],
+                issues=preflight_issues,
+                fix_instructions=[fix_instruction],
             )
         else:
             verdict = checker.check(code, target)
@@ -182,7 +186,7 @@ def run_fix_loop(
                 "round": round_num,
                 "timestamp": timestamp,
                 "phase": "check",
-                "checker_skipped": preflight_error is not None,
+                "checker_skipped": bool(preflight_issues),
                 "prompt": checker.last_prompt,
                 "response": checker.last_response,
                 "verdict": verdict.verdict.value,
@@ -209,9 +213,8 @@ def run_fix_loop(
         )
         if candidate_gate is not None:
             result = candidate_gate(result)
-        gate_issues = [f"parity: {f.reason}" for f in result.parity_findings]
-        if result.validation_verdict and result.validation_verdict.verdict != Verdict.PASS:
-            gate_issues.extend([result.validation_verdict.summary, *result.validation_verdict.findings])
+        # Preflight diagnostics already reach the fix prompt as checker issues.
+        gate_issues = [issue for issue in _gate_issues(result) if issue not in verdict.issues]
         if log_dir:
             from re_agent.reports.formatter import results_to_json
 
@@ -238,6 +241,13 @@ def run_fix_loop(
         seen_failures.add(failure_key)
 
     return result
+
+
+def _gate_issues(result: ReversalResult) -> list[str]:
+    issues = [f"parity: {f.reason}" for f in result.parity_findings]
+    if result.validation_verdict and result.validation_verdict.verdict != Verdict.PASS:
+        issues.extend([result.validation_verdict.summary, *result.validation_verdict.findings])
+    return issues
 
 
 def _provider_metadata(provider: LLMProvider) -> dict[str, object]:
