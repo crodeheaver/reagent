@@ -1,7 +1,5 @@
 # ReAgent
 
-For a decoupled local progress window with optional worker controls, see the [live monitor guide](docs/live-monitor.md).
-
 [![PyPI](https://img.shields.io/pypi/v/auto-re-agent)](https://pypi.org/project/auto-re-agent/)
 [![Python](https://img.shields.io/pypi/pyversions/auto-re-agent)](https://pypi.org/project/auto-re-agent/)
 [![CI](https://github.com/Dryxio/reagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Dryxio/reagent/actions/workflows/ci.yml)
@@ -363,8 +361,12 @@ Global options must precede the subcommand, for example
 | `re-agent status --class CLASS --format text` | Show session progress |
 | `re-agent estimate --address ADDR` | Estimate one function |
 | `re-agent estimate --class CLASS --limit N` | Estimate a class batch |
+| `re-agent monitor --work-dir DIR --total N` | Serve a local live progress dashboard |
 
 Use `re-agent <command> --help` for the exact option list.
+
+For the dashboard and its optional worker start/stop controls, see the
+[live monitor guide](docs/live-monitor.md).
 
 ## Working with function groups
 
