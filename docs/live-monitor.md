@@ -6,7 +6,12 @@
 re-agent monitor --work-dir /path/to/project --session-glob re-agent-progress.json --total 500
 ```
 
-Open the printed `http://127.0.0.1:8765` address. The page refreshes every two seconds and shows saved function results, review passes, failures, rounds, and recent log output. Omit `--total` when the planned count is unknown. A review pass is not a proof of compilation or binary equivalence.
+Open the printed `http://127.0.0.1:8765` address. The page updates live over a local WebSocket and shows saved function results, review passes, failures, rounds, and recent log output. Omit `--total` when the planned count is unknown. A review pass is not a proof of compilation or binary equivalence.
+
+The host checks session, log, progress and event files every 500 ms. Each browser tab
+receives one full snapshot when it connects, then only the fields and agents that
+changed; the refresh clock, source-data age and elapsed-time details travel in a small
+tick about once a second. Reconnecting loads a fresh snapshot.
 
 Session patterns are relative to `--work-dir` and can be repeated. For a batch runner:
 
@@ -74,9 +79,7 @@ a freshness indication, not proof that a process has exited.
 Compiled drafts are explicitly distinguished from accepted reconstructions.
 Child counts describe starts and collected results, not measured model-request
 concurrency. The existing layout displays elapsed time, throughput, batch
-progress, diagnostics and source-data age. The browser receives an initial snapshot over `/api/stream`, followed by WebSocket
-updates. Reconnects load a fresh snapshot; no periodic browser status requests are used.
-The host checks local progress files every 500 ms. Controls remain authenticated HTTP POSTs.
+progress, diagnostics and source-data age.
 
 Use `--event-glob "batch-*/native.jsonl"` to enable the agent workspace for native
 Grok event logs. Select the live batch or an earlier batch, then an agent to inspect

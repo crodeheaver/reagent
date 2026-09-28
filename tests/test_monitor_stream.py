@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -47,7 +48,7 @@ def test_websocket_initial_snapshot_then_live_update(tmp_path):
             atomic_json(path, {"functions": {"a": {"address": "100", "success": True}}})
             for _ in range(10):
                 update = receive()
-                if update["data"]["completed"] == 1:
+                if update["data"].get("completed") == 1:  # Clock ticks carry no counters.
                     break
             assert update["type"] == "update"
             assert update["data"]["completed"] == 1
@@ -185,3 +186,78 @@ def test_stream_closes_cleanly_when_state_is_unavailable(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def open_stream(server):
+    host = f"127.0.0.1:{server.server_port}"
+    sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+    ws = WSConnection(ConnectionType.CLIENT)
+    sock.sendall(ws.send(Request(host=host, target="/api/stream",
+                                 extra_headers=[(b"Origin", f"http://{host}".encode())])))
+    return sock, ws
+
+
+def stream_messages(sock, ws, seconds):
+    messages, pending = [], ""
+    sock.settimeout(.2)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            data = sock.recv(1 << 20)
+        except TimeoutError:
+            continue
+        ws.receive_data(data)
+        for event in ws.events():
+            if isinstance(event, TextMessage):
+                pending += event.data
+                if event.message_finished:
+                    messages.append((len(pending), json.loads(pending)))
+                    pending = ""
+    return messages
+
+
+def test_idle_stream_sends_small_ticks_not_full_snapshots(tmp_path):
+    (tmp_path / "b1").mkdir()
+    (tmp_path / "b1" / "native.jsonl").write_text(json.dumps({"type": "text", "data": "x" * 60000}) + "\n")
+    path = tmp_path / "session.json"
+    path.write_text('{"functions": {}}')
+    server = make_server(Monitor(tmp_path, tmp_path / "state", ["session.json"], event_glob="*/native.jsonl"), 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        sock, ws = open_stream(server)
+        with sock:
+            messages = stream_messages(sock, ws, 2.6)
+            assert messages[0][1]["type"] == "snapshot"
+            assert messages[0][0] > 60000
+            idle = messages[1:]
+            assert idle and all(message["type"] == "tick" and size < 1000 for size, message in idle)
+            atomic_json(path, {"functions": {"a": {"address": "100", "success": True}}})
+            updates = [m for _, m in stream_messages(sock, ws, 1.5) if m["type"] == "update"]
+            assert updates[0]["data"]["completed"] == 1
+            assert "agents" not in updates[0] and "output" not in updates[0]["data"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_stream_diff_sends_changed_fields_and_agents_only():
+    from re_agent.monitor.server import StreamDiff
+
+    agents = [{"id": f"a{n}", "label": "", "status": "running", "text": "t" * 1000, "log": ""} for n in range(3)]
+    state = {"completed": 1, "phase": "running", "updated": "10:00:00", "agents": agents}
+    diff = StreamDiff()
+    assert diff.message(json.loads(json.dumps(state)))["type"] == "snapshot"
+    assert diff.message(json.loads(json.dumps(state))) is None
+    state["updated"] = "10:00:01"
+    assert diff.message(json.loads(json.dumps(state))) == {"type": "tick", "data": {"updated": "10:00:01"}}
+    state["agents"][1]["status"] = "completed"
+    state["agents"] = state["agents"][1:]
+    state.pop("phase")
+    message = diff.message(json.loads(json.dumps(state)))
+    assert message["type"] == "update"
+    assert message["data"] == {"updated": "10:00:01"}
+    assert message["removed"] == ["phase"]
+    assert message["agents"]["order"] == ["a1", "a2"]
+    assert [agent["id"] for agent in message["agents"]["changed"]] == ["a1"]

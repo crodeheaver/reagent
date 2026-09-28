@@ -77,7 +77,11 @@ class AgentEvents:
             except (ValueError, RecursionError):
                 # Malformed, truncated or pathologically nested lines are skipped, never fatal.
                 continue
-        return list(self.agents.values())
+        return self.view()
+
+    def view(self) -> list[dict[str, Any]]:
+        # Copies: callers serialise outside the monitor lock while later reads mutate agents.
+        return [dict(agent) for agent in self.agents.values()]
 
     def consume(self, row: dict[str, Any], batch: str) -> None:
         # Unattributed token events must never be guessed to belong to a child.

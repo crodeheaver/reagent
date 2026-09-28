@@ -21,6 +21,8 @@ from re_agent.utils.storage import atomic_json, file_lock
 
 # External progress older than this is shown as stale and no longer vouches for its PID.
 STALE_AFTER_S = 60
+# Snapshot fields that change with the clock alone; streamed as small ticks, not full updates.
+VOLATILE = ("updated", "data_age_s", "details")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -314,7 +316,7 @@ class Monitor:
                 result["agents"] = self.agent_events.read(latest)
             except OSError:
                 if self.agent_events.path == latest:
-                    result["agents"] = list(self.agent_events.agents.values())
+                    result["agents"] = self.agent_events.view()
         return result
 
     def external_progress(self) -> dict[str, Any]:
@@ -382,6 +384,40 @@ class Monitor:
                 "error": data.get("error"), "activity": summary, "details": details,
                 "data_age_s": max(0, time.time() - updated) if isinstance(updated, (int, float)) else None,
                 "diagnostics": "\n".join(diagnostics)[-7000:]}
+
+
+class StreamDiff:
+    """One full snapshot per client, then only changed fields and changed agents."""
+
+    def __init__(self) -> None:
+        self.fields: dict[str, str] | None = None
+        self.agents: dict[str, str] = {}
+        self.order: list[str] = []
+
+    def message(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        agents = snapshot.get("agents") or []
+        fields = {key: json.dumps(value, sort_keys=True) for key, value in snapshot.items() if key != "agents"}
+        encoded = {agent["id"]: json.dumps(agent, sort_keys=True) for agent in agents}
+        order = [agent["id"] for agent in agents]
+        previous, known, known_order = self.fields, self.agents, self.order
+        self.fields, self.agents, self.order = fields, encoded, order
+        if previous is None:
+            return {"type": "snapshot", "data": snapshot}
+        volatile = {key: snapshot[key] for key in VOLATILE if key in snapshot}
+        changed = {key: snapshot[key] for key, value in fields.items()
+                   if key not in VOLATILE and previous.get(key) != value}
+        removed = [key for key in previous if key not in fields]
+        patch = [agent for agent in agents if known.get(agent["id"]) != encoded[agent["id"]]]
+        if changed or removed or patch or order != known_order:
+            message: dict[str, Any] = {"type": "update", "data": {**changed, **volatile}}
+            if removed:
+                message["removed"] = removed
+            if patch or order != known_order:
+                message["agents"] = {"order": order, "changed": patch}
+            return message
+        if any(previous.get(key) != fields.get(key) for key in VOLATILE):
+            return {"type": "tick", "data": volatile}
+        return None
 
 
 def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
@@ -460,19 +496,16 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                 list(ws.events())
                 self.connection.settimeout(5)
                 self.connection.sendall(ws.send(AcceptConnection()))
-                previous = ""
-                first = True
+                diff = StreamDiff()
                 while True:
                     try:
                         data = monitor.snapshot()
                     except Exception:  # Tell the client instead of dropping the socket; it reconnects.
                         self.connection.sendall(ws.send(CloseConnection(code=1011, reason="Monitor state unavailable")))
                         return
-                    encoded = json.dumps(data)
-                    if encoded != previous:
-                        self.connection.sendall(ws.send(TextMessage(data=json.dumps({
-                            "type": "snapshot" if first else "update", "data": data}))))
-                        previous, first = encoded, False
+                    message = diff.message(data)
+                    if message is not None:
+                        self.connection.sendall(ws.send(TextMessage(data=json.dumps(message))))
                     ready, _, _ = select.select([self.connection], [], [], 0.5)
                     if ready:
                         payload = self.connection.recv(4096)
