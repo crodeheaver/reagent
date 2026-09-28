@@ -99,3 +99,25 @@ def test_stream_rejects_foreign_origin_and_history_cannot_escape(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_native_event_fields_stay_bounded_and_odd_lines_are_skipped(tmp_path):
+    path = tmp_path / ("batch-" + "b" * 200) / "native.jsonl"
+    path.parent.mkdir()
+    rows = [b"[" * 100000 + b"]" * 100000, b'{"type": "text", "data": ', b"\xff\xfe"]
+    rows += [json.dumps({"type": "tool_call_update", "rawOutput": {"MultiResult": {"results": [
+        {"task_id": "t" * 5000 + str(n), "status": ["s"] * 20000, "command": "c" * 5000, "output": "x"}]}}}).encode()
+        for n in range(130)]
+    rows.append(b'{"type":"text","data":"after odd lines"}')
+    path.write_bytes(b"\n".join(rows) + b"\n")
+    reader = AgentEvents()
+    while reader.offset < path.stat().st_size:
+        agents = reader.read(path)
+    assert len(agents) == 128
+    assert len({agent["id"] for agent in agents}) == 128
+    for agent in agents:
+        assert len(agent["id"]) <= 128 and len(agent["label"]) <= 256 and len(agent["status"]) <= 64
+        assert len(agent["text"]) <= 65536 and len(agent["log"]) <= 65536
+    shared = agents[-1]
+    assert shared["id"].endswith(":shared")
+    assert shared["text"] == "after odd lines"

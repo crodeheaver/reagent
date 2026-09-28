@@ -78,9 +78,12 @@ Use `--event-glob "batch-*/native.jsonl"` to enable the agent workspace for nati
 Grok event logs. Select the live batch or an earlier batch, then an agent to inspect
 its code, full response, and tool activity. Unattributed token events stay in a
 shared stream; child results are assigned only by provider task IDs. Thought events
-are excluded. Each agent text/log tail is bounded to 64 KiB, with at most 128 recent
-agents retained. Historical reads are limited to 32 MiB per source. The source must
-match the configured pattern inside the run directory.
+are excluded. Each agent keeps the last 65,536 characters of its text and of its
+activity log. Agent IDs are shortened to 128 characters (a digest keeps long IDs
+distinct), labels to 256 and statuses to 64, and at most 128 recently active agents are
+retained. Malformed or excessively nested lines are skipped. Historical reads are
+limited to 32 MiB per source. The source must match the configured pattern inside the
+run directory.
 
 ## Native Windows session storage
 
