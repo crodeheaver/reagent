@@ -8,6 +8,7 @@ from pathlib import Path
 
 from re_agent.backend.registry import create_backend
 from re_agent.config.loader import load_config
+from re_agent.llm.registry import CLI_EXECUTABLES
 
 
 def cmd_estimate(args: argparse.Namespace) -> int:
@@ -66,7 +67,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
             ("reverser", reverser_config.provider),
             ("checker", checker_config.provider),
         )
-        if provider in {"claude-cli", "codex"}
+        if provider in CLI_EXECUTABLES
     ]
     if cli_roles:
         print("Note: max_tokens is an estimate, not a hard provider limit, for CLI roles: " + ", ".join(cli_roles))
