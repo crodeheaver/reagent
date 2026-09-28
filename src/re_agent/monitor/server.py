@@ -68,6 +68,8 @@ class Monitor:
                 raise RuntimeError("Worker controls require: pip install 'auto-re-agent[monitor]'") from exc
             self.psutil = psutil
         self.lock = threading.RLock()
+        # Start/stop wait for processes; a separate lock keeps snapshots and streams live meanwhile.
+        self.control = threading.Lock()
         self.cache: dict[Path, tuple[tuple[int, int], list[dict[str, Any]]]] = {}
         self._adopt()
 
@@ -114,7 +116,7 @@ class Monitor:
     def start(self) -> dict[str, Any]:
         if not self.worker:
             raise ValueError("Read-only monitor: no worker command configured")
-        with self.lock, file_lock(self.record):
+        with self.control, file_lock(self.record):
             self._adopt()
             if self.active():
                 return {"message": "Already running", "pid": self.process.pid}
@@ -173,7 +175,7 @@ class Monitor:
             return {"message": "Cooperative stop requested; the external runner handles cancellation."}
         if not self.worker:
             raise ValueError("Read-only monitor: no worker command configured")
-        with self.lock, file_lock(self.record):
+        with self.control, file_lock(self.record):
             self._adopt()
             if self.active():
                 # Provider and compiler CLIs run in their own sessions, outside the

@@ -248,6 +248,31 @@ def test_exited_worker_is_reaped_while_monitoring(tmp_path):
     assert monitor.snapshot()["phase"] == "exited"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="taskkill does not wait for SIGTERM")
+def test_snapshots_stay_live_while_stop_waits_for_exit(tmp_path):
+    script = tmp_path / "stubborn.py"
+    script.write_text("import pathlib, signal, time\n"
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "pathlib.Path('ready').touch()\n"
+                      "time.sleep(60)\n", encoding="utf-8")
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, str(script)])
+    monitor.start()
+    stopper = threading.Thread(target=monitor.stop)
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "ready").exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        stopper.start()
+        time.sleep(.5)
+        assert stopper.is_alive()  # Waiting for the ignored SIGTERM before escalating.
+        began = time.monotonic()
+        assert monitor.snapshot()["phase"] in {"running", "stopped"}
+        assert time.monotonic() - began < 2
+    finally:
+        stopper.join(timeout=30)
+        assert not monitor.active()
+
+
 @pytest.fixture
 def http_monitor(tmp_path):
     monitor = Monitor(tmp_path, tmp_path / "state", [])
