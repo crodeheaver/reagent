@@ -218,6 +218,24 @@ def test_deferred_proposal_waits_for_its_own_target_set(setup, monkeypatch, tmp_
     assert session.is_completed(targets[0].address) and session.attempt_count(targets[0].address) == 1
 
 
+def test_deferred_proposal_superseded_by_accepted_result_is_dropped(setup, monkeypatch, tmp_path):
+    config, backend, targets, session = setup
+    config.validation.project_root = str(tmp_path)
+    Path(config.project_profile.source_root).mkdir()
+    cancel = threading.Event()
+
+    def stopped(result, view):
+        cancel.set()
+        current().check()
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single",
+                        lambda target, *args, **kwargs: ReversalResult(target, "stale", success=True))
+    reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, cancel=cancel, promote=stopped)
+    session.record_result(ReversalResult(targets[0], "accepted", success=True))  # e.g. a sequential run
+    assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, promote=lambda r, v: r) == []
+    assert session.get_all_functions()[0]["code"] == "accepted" and session.attempt_count(targets[0].address) == 1
+
+
 def test_locked_status_file_does_not_stop_the_run(setup, monkeypatch):
     from re_agent.utils.storage import atomic_json
 

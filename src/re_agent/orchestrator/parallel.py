@@ -228,8 +228,11 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
     for value in jobs.values():
         # Proposals are finished attempts whose promotion or publication a stop deferred;
         # another target set's proposals wait for a run whose scratch project they belong to.
-        if value["state"] == "proposed" and value.get("result") and value["address"] not in by_address:
+        proposal = value["state"] == "proposed" and value.get("result")
+        if proposal and value["address"] not in by_address:
             continue
+        if proposal and session.is_completed(value["address"]):
+            value["state"] = "interrupted"  # Superseded by a result accepted since the stop.
         if value["state"] in {"completed", "failed", "proposed"} and value.get("result"):
             recovered = decode_result(value["result"])
             changed = value["state"] == "proposed"
