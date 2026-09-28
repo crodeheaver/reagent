@@ -81,7 +81,9 @@ shared stream; child results are assigned only by provider task IDs. Thought eve
 are excluded. Each agent keeps the last 65,536 characters of its text and of its
 activity log. Agent IDs are shortened to 128 characters (a digest keeps long IDs
 distinct), labels to 256 and statuses to 64, and at most 128 recently active agents are
-retained. Malformed or excessively nested lines are skipped. Historical reads are
+retained. Malformed or excessively nested lines are skipped. The live batch follows the
+most recently modified matching log; when that changes, or the log is truncated, replaced
+or rewritten, the view restarts from the new log instead of mixing batches. Historical reads are
 limited to 32 MiB per source. The source must match the configured pattern inside the
 run directory.
 

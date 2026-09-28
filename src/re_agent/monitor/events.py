@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -14,6 +15,7 @@ ID_LIMIT = 128
 LABEL_LIMIT = 256
 STATUS_LIMIT = 64
 BATCH_LIMIT = 64
+HEAD_BYTES = 256
 
 
 def clip(value: object, limit: int) -> str:
@@ -32,6 +34,8 @@ def agent_key(value: str) -> str:
 class AgentEvents:
     def __init__(self) -> None:
         self.path: Path | None = None
+        self.identity: tuple[int, int] | None = None
+        self.head = b""
         self.offset = 0
         self.pending = b""
         self.agents: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -47,12 +51,21 @@ class AgentEvents:
         return self.agents[key]
 
     def read(self, path: Path) -> list[dict[str, Any]]:
-        if path != self.path or path.stat().st_size < self.offset:
-            self.path, self.offset, self.pending = path, 0, b""
         with path.open("rb") as stream:
-            stream.seek(self.offset)
+            stat = os.fstat(stream.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            if (path != self.path or identity != self.identity or stat.st_size < self.offset
+                    or stream.read(len(self.head)) != self.head):
+                # A different, replaced, truncated or rewritten source starts a fresh view;
+                # continuing at the old offset would duplicate or mix unrelated output.
+                self.path, self.identity, self.offset, self.pending, self.head = path, identity, 0, b"", b""
+                self.agents.clear()
+            start = self.offset
+            stream.seek(start)
             data = stream.read(1024 * 1024)
             self.offset = stream.tell()
+        if start == 0:
+            self.head = data[:HEAD_BYTES]
         lines = (self.pending + data).split(b"\n")
         self.pending = lines.pop()[-1024 * 1024:]
         batch = clip(path.parent.name, BATCH_LIMIT)

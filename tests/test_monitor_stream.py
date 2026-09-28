@@ -1,5 +1,6 @@
 """Exercise real WebSocket initialization, updates, and native event attribution."""
 import json
+import os
 import socket
 import threading
 import urllib.error
@@ -121,3 +122,37 @@ def test_native_event_fields_stay_bounded_and_odd_lines_are_skipped(tmp_path):
     shared = agents[-1]
     assert shared["id"].endswith(":shared")
     assert shared["text"] == "after odd lines"
+
+
+def text_lines(*values):
+    return "".join(json.dumps({"type": "text", "data": value}) + "\n" for value in values)
+
+
+def test_live_batch_view_follows_one_source_without_duplication(tmp_path):
+    first, second = tmp_path / "b1" / "native.jsonl", tmp_path / "b2" / "native.jsonl"
+    for path in (first, second):
+        path.parent.mkdir()
+    first.write_text(text_lines("A1 "))
+    reader = AgentEvents()
+    assert [a["text"] for a in reader.read(first)] == ["A1 "]
+    second.write_text(text_lines("B1 "))
+    assert [(a["id"], a["text"]) for a in reader.read(second)] == [("b2:shared", "B1 ")]
+    with first.open("a") as stream:
+        stream.write(text_lines("A2 "))
+    assert [(a["id"], a["text"]) for a in reader.read(first)] == [("b1:shared", "A1 A2 ")]
+
+
+def test_rewritten_or_replaced_source_restarts_the_view(tmp_path):
+    path = tmp_path / "b1" / "native.jsonl"
+    path.parent.mkdir()
+    reader = AgentEvents()
+    path.write_text(text_lines("X"))
+    assert reader.read(path)[0]["text"] == "X"
+    path.write_text(text_lines("Y", "Z"))  # rewritten in place, larger than before
+    assert reader.read(path)[0]["text"] == "YZ"
+    path.write_text(text_lines("Y" * 300, "Z"))
+    assert reader.read(path)[0]["text"] == "Y" * 300 + "Z"
+    replacement = tmp_path / "b1" / "native.jsonl.tmp"
+    replacement.write_text(text_lines("Y" * 300, "C" * 40, "D"))  # identical head, different file
+    os.replace(replacement, path)
+    assert reader.read(path)[0]["text"] == "Y" * 300 + "C" * 40 + "D"
