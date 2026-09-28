@@ -1,6 +1,7 @@
 """Deterministic scheduler tests without network/model requests."""
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
@@ -63,7 +64,41 @@ def test_bounded_overlap_isolation_order_and_checkpoints(setup, monkeypatch, wor
     assert all(session.attempt_count(t.address) == 1 for t in targets)
 
 
-def test_cancel_late_result_and_resume_budget(setup, monkeypatch):
+def test_stop_keeps_results_that_finished(setup, monkeypatch):
+    config, backend, targets, session = setup
+    cancel = threading.Event()
+
+    def finished(target, cfg, backend, llm, **kwargs):
+        current().emit("checkpoint", ReversalResult(target, code="late", success=True, rounds_used=1))
+        cancel.set()  # Stop arrives after the attempt finished, before publication.
+        return ReversalResult(target, code="late", success=True, rounds_used=1)
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", finished)
+    result = reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, cancel=cancel)
+    assert [(r.code, r.success) for r in result] == [("late", True)]
+    assert session.is_completed(targets[0].address) and session.attempt_count(targets[0].address) == 1
+    assert json.loads(session.path.with_suffix(".json.execution.json").read_text())["phase"] == "stopped"
+
+
+def test_interrupted_attempt_keeps_recorded_success_without_new_calls(setup, monkeypatch):
+    config, backend, targets, session = setup
+    config.orchestrator.max_review_rounds = 2
+    cancel = threading.Event()
+
+    def interrupted(target, cfg, backend, llm, *, session, **kwargs):
+        session.record_checkpoint(ReversalResult(target, code="accepted", success=True, rounds_used=2))
+        cancel.set()
+        current().check()  # Cancelled after the final round was recorded.
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", interrupted)
+    assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, cancel=cancel) == []
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", Mock(side_effect=AssertionError))
+    result = reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1)
+    assert [(r.code, r.success, r.rounds_used) for r in result] == [("accepted", True, 2)]
+    assert session.attempt_count(targets[0].address) == 1
+
+
+def test_cancel_interrupted_attempt_and_resume_budget(setup, monkeypatch):
     config, backend, targets, session = setup
     cancel = threading.Event()
     budgets = []
@@ -72,7 +107,7 @@ def test_cancel_late_result_and_resume_budget(setup, monkeypatch):
         current().emit("call", "reverser")
         current().emit("checkpoint", ReversalResult(target, code="draft", rounds_used=1))
         cancel.set()
-        return ReversalResult(target, code="late", success=True)
+        current().check()
 
     monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", interrupted)
     assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, cancel=cancel) == []
@@ -251,6 +286,82 @@ def test_cumulative_proposals_same_file_revalidate_latest_generation(tmp_path, m
     assert source.read_text() == original
     assert len(set(snapshots)) == 2 and all(not p.exists() for p in snapshots)
     assert not session.is_completed("2")
+
+
+@pytest.mark.parametrize("stage", ["waiting", "promoting"])
+def test_stop_keeps_cumulative_proposal_for_next_run(tmp_path, monkeypatch, stage):
+    from re_agent.backend.stub import StubBackend
+    from re_agent.core.target_plan import TargetPlan
+    from re_agent.orchestrator.batch_runner import reverse_manifest
+    from tests.test_audit_regressions import config_for
+
+    config = config_for(tmp_path)
+    config.validation.enabled = False
+    config.validation.copy_project = True
+    config.validation.project_root = str(tmp_path)
+    config.orchestrator.max_parallel_functions = 2
+    config.orchestrator.max_attempts_per_function = 1
+    source = Path(config.project_profile.source_root) / "f.cpp"
+    source.write_text("int a() { return 0; }\nint b() { return 0; }\n")
+    plan = TargetPlan("a" * 64, [], [FunctionTarget("1", "", "a"), FunctionTarget("2", "", "b")])
+    session = Session(config.output.session_file)
+    stop = session.path.with_suffix(".json.execution.stop")
+    b_done, calls, first_run = threading.Event(), [], [True]
+
+    def fake(target, cfg, *args, **kwargs):
+        calls.append(target.function_name)
+        if target.function_name == "b":
+            b_done.set()
+        elif stage == "waiting" and first_run[0]:  # b finishes first and waits for a's promotion
+            assert b_done.wait(10)
+            stop.write_text("")
+            while True:
+                current().check()
+                time.sleep(.01)
+        return ReversalResult(target, f"int {target.function_name}() {{ return 7; }}", success=True)
+
+    def validate(result, cfg, backend):
+        if stage == "promoting" and first_run[0]:
+            stop.write_text("")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                current().check()  # Promotion validation observes the stop.
+                time.sleep(.01)
+        return result
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", fake)
+    monkeypatch.setattr("re_agent.orchestrator.class_runner.validate_result", validate)
+    first = reverse_manifest(plan, config, StubBackend(), None, session, 4, provider_factory=lambda c: Mock())
+    assert json.loads(session.path.with_suffix(".json.execution.json").read_text())["phase"] == "stopped"
+    assert not any(r.success for r in first) and not session.is_completed("2")
+    calls.clear()
+    first_run[0] = False
+    reverse_manifest(plan, config, StubBackend(), None, session, 4, provider_factory=lambda c: Mock())
+    assert session.is_completed("1") and session.is_completed("2")
+    assert calls == (["a"] if stage == "waiting" else [])  # The finished proposal is not re-run.
+    assert all(session.attempt_count(a) == 1 for a in ("1", "2"))
+
+
+def test_unpromotable_proposal_fails_its_attempt(tmp_path, monkeypatch):
+    from re_agent.backend.stub import StubBackend
+    from re_agent.core.target_plan import TargetPlan
+    from re_agent.orchestrator.batch_runner import reverse_manifest
+    from tests.test_audit_regressions import config_for
+
+    config = config_for(tmp_path)
+    config.validation.enabled = False
+    config.validation.copy_project = True
+    config.validation.project_root = str(tmp_path)
+    config.orchestrator.max_parallel_functions = 2
+    config.orchestrator.max_attempts_per_function = 1
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single",
+                        lambda target, *a, **k: ReversalResult(target, "int missing() { return 1; }", success=True))
+    session = Session(config.output.session_file)
+    plan = TargetPlan("a" * 64, [], [FunctionTarget("1", "", "missing")])
+    for _ in range(2):  # The journaled outcome must not fail recovery either.
+        reverse_manifest(plan, config, StubBackend(), None, session, 1, provider_factory=lambda c: Mock())
+    assert not session.is_completed("1") and session.attempt_count("1") == 1
+    assert "unique source definition" in session.get_all_functions()[0]["error"]
 
 
 @pytest.mark.parametrize("error", [ValueError, RuntimeError])

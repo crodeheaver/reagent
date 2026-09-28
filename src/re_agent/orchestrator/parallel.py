@@ -220,11 +220,18 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         results.append(result)
 
     for value in jobs.values():
-        if value["state"] in {"completed", "failed"}:
+        # Proposals are finished attempts whose promotion or publication a stop deferred.
+        if value["state"] in {"completed", "failed", "proposed"} and value.get("result"):
             recovered = decode_result(value["result"])
+            changed = value["state"] == "proposed"
             if promote and recovered.success and not session.is_completed(recovered.target.address):
-                with executing(Execution(cancel, gate, lambda k, v: None)):
-                    recovered = promote(recovered, backend)
+                try:
+                    with executing(Execution(cancel, gate, lambda k, v: None)):
+                        recovered = promote(recovered, backend)
+                except Cancelled:
+                    continue
+                changed = True
+            if changed:
                 value.update(state="completed" if recovered.success else "failed", result=_result_to_dict(recovered))
                 save(value["id"])
             session.record_result_once(recovered)
@@ -255,11 +262,20 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         offset = int(snapshot.get("rounds", 0))
         isolated.orchestrator.max_review_rounds -= offset
         isolated.orchestrator.max_llm_calls_per_function -= int(snapshot.get("calls", 0))
-        if min(isolated.orchestrator.max_review_rounds, isolated.orchestrator.max_llm_calls_per_function) <= 0:
+        exhausted = min(isolated.orchestrator.max_review_rounds, isolated.orchestrator.max_llm_calls_per_function) <= 0
+        # A round this attempt already recorded is its result when it passed or no budget remains.
+        if offset and snapshot.get("checkpoint") and (snapshot["checkpoint"].get("success") or exhausted):
+            final = decode_result(snapshot["checkpoint"])
+            final.run_id = job
+            if not final.success:
+                final.error = final.error or "Interrupted attempt exhausted its saved budget"
+            return final
+        if exhausted:
             return ReversalResult(t, code="", success=False,
                                   error="Interrupted attempt exhausted its saved budget", run_id=job)
         providers: list[LLMProvider] = []
         try:
+            from re_agent.orchestrator.execution import current
             from re_agent.orchestrator.snapshot import project_snapshot
 
             with (executing(Execution(cancel, gate, lambda kind, value: emit(job, kind, value),
@@ -277,6 +293,8 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                 result = reverse_single(t, isolated, cast(REBackend, LockedBackend(backend, backend_lock, cancel)),
                     providers[0], checker_llm=providers[1], session=WorkerSession(
                         feedback, lambda kind, value: emit(job, kind, value), offset))
+                if cast(Execution, current()).interrupted:
+                    raise Cancelled("Attempt interrupted before it finished")
                 result.rounds_used += offset
                 result.run_id = job
                 return result
@@ -297,8 +315,6 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                 if event.kind == "fatal":
                     failure = event.value
                     cancel.set()
-                    continue
-                if cancel.is_set():
                     continue
                 value = jobs[event.job]
                 if event.kind == "checkpoint":
@@ -332,31 +348,33 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                         if not future.done():
                             continue
                         job = futures.pop(future)
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                            continue
                         try:
                             result = future.result()
                         except Exception as exc:
+                            if cancel.is_set():
+                                jobs[job]["state"] = "interrupted"
+                                continue
                             result = ReversalResult(by_address[jobs[job]["address"]], code="", success=False,
                                                     error=str(exc), run_id=job)
+                        # Journal finished results so neither a stop nor a crash loses them.
                         proposed[job] = result
-                        jobs[job]["state"] = "proposed"
+                        jobs[job].update(state="proposed", result=_result_to_dict(result))
+                        save(job)
                     # Cumulative promotion follows dispatch order, never completion order.
                     for job in sorted(list(proposed), key=lambda j: jobs[j]["sequence"]):
                         if promote and any(jobs[j]["sequence"] < jobs[job]["sequence"] for j in futures.values()):
                             break
-                        result = proposed.pop(job)
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                            continue
+                        result = proposed[job]
                         if promote and result.success:
-                            with generation_lock, executing(Execution(cancel, gate, lambda k, v: None)):
-                                result = promote(result, cast(REBackend, LockedBackend(backend, backend_lock, cancel)))
-                        if cancel.is_set():
-                            jobs[job]["state"] = "interrupted"
-                        else:
-                            publish(job, result)
+                            # Promotion validates; after a stop the next run promotes the journaled proposal.
+                            try:
+                                with generation_lock, executing(Execution(cancel, gate, lambda k, v: None)):
+                                    result = promote(result, cast(REBackend, LockedBackend(backend, backend_lock,
+                                                                                           cancel)))
+                            except Cancelled:
+                                break
+                        del proposed[job]
+                        publish(job, result)
                     active_addresses = {jobs[j]["address"] for j in [*futures.values(), *proposed]}
                     pending = {a for a in order if a not in completed
                                and attempts.get(a, 0) < config.orchestrator.max_attempts_per_function}
@@ -378,7 +396,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
                         futures[executor.submit(worker, job, copy.deepcopy(value))] = job
                         active_addresses.add(ready)
                         submitted += 1
-                    if not futures and not proposed:
+                    if not futures and (not proposed or cancel.is_set()):
                         break
                     time.sleep(.05)
             finally:
@@ -393,7 +411,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         watcher_done.set()
         watcher.join()
         for value in jobs.values():
-            if value["state"] in {"running", "proposed"}:
+            if value["state"] == "running" or (value["state"] == "proposed" and not value.get("result")):
                 value["state"] = "interrupted"
             if value["state"] == "interrupted":
                 save(value["id"])

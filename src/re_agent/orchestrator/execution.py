@@ -11,7 +11,13 @@ from typing import Any
 
 
 class Cancelled(RuntimeError):
-    pass
+    """Raised at cancellation points; marks the calling thread's attempt as interrupted."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        context = current()
+        if context is not None:
+            context.interrupted = True
 
 
 @dataclass
@@ -21,8 +27,10 @@ class Execution:
     emit: Callable[[str, Any], None]
     requests: RequestQueue | None = None
     request_retries: int = 0
+    interrupted: bool = False
 
     def fail(self, category: str, message: str) -> None:
+        self.interrupted = True
         self.emit("fatal", {"category": category, "message": message})
         self.cancel.set()
 

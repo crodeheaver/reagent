@@ -76,10 +76,13 @@ storage. Only the coordinator writes final session results.
 Per-attempt journals live below the configured report directory in
 `parallel/<identity>/jobs/<attempt-id>.json`; worker artifacts are in sibling
 attempt directories. Final publication is idempotent by attempt ID, including
-recovery after a crash between journal and session writes. Interrupted attempts
-retain completed rounds, previous feedback, and spent call budget. They resume
-with the remaining budget; exhaustion records a failure instead of granting free
-calls. A later attempt follows the normal attempt limit.
+recovery after a crash between journal and session writes. A finished attempt's
+result is journaled before promotion or publication, so a stop or crash never
+discards it; the next run promotes and publishes it without new model calls.
+Interrupted attempts retain completed rounds, previous feedback, and spent call
+budget. They resume with the remaining budget; a recorded passing round, or the
+last recorded round once the budget is spent, becomes the attempt's result instead
+of granting free calls. A later attempt follows the normal attempt limit.
 
 Worker counts do not change semantic identity. Changing source, evidence, model
 identity (provider, model, base URL, effort), or acceptance policy invalidates
@@ -104,7 +107,9 @@ Dead workers display interrupted stages. Existing sequential/older sessions keep
 their previous display, and review verdicts and validation outcomes are separate.
 
 Stop first closes dispatch and requests cooperative cleanup. Waiting jobs and
-local subprocesses observe cancellation; cancelled late results are discarded.
+local subprocesses observe cancellation. Attempts that finished are still
+published; a successful proposal whose cumulative promotion a stop interrupts stays
+journaled for the next run.
 Synchronous API calls finish or reach their configured transport timeout. SDK
 retries are disabled so they cannot silently spend calls beyond the recorded
 budget. The monitor shows Stopping during cleanup; **Force stop** terminates the

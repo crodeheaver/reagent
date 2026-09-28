@@ -153,7 +153,10 @@ def _reverse_class_run(
             # Provisional successes must pass unchanged gates on the latest generation.
             result = validate_result(result, effective, view)
             if result.success:
-                _promote(result, effective)
+                try:
+                    _promote(result, effective)
+                except ValueError as exc:  # A journaled proposal must not fail every recovery.
+                    result.success, result.error = False, str(exc)
             return result
 
         assert provider_factory is not None
