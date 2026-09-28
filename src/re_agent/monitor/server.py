@@ -82,6 +82,10 @@ class Monitor:
     def _adopt(self) -> None:
         if not self.worker:
             return
+        if isinstance(self.process, self.psutil.Popen) and self.process.poll() is None:
+            # Keep our own child's handle: polling it reaps the worker once it exits,
+            # whereas an adopted psutil.Process would leave it a zombie.
+            return
         saved = read_json(self.record)
         try:
             if saved.get("command") != self.worker or saved.get("cwd") != str(self.work_dir):

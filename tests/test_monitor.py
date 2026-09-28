@@ -236,6 +236,18 @@ def test_natural_exit_is_distinct_from_explicit_stop(tmp_path):
     assert Monitor(tmp_path, tmp_path / "state", [], worker=command).snapshot()["phase"] == "exited"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows does not keep zombie processes")
+def test_exited_worker_is_reaped_while_monitoring(tmp_path):
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "import time; time.sleep(.3)"])
+    pid = monitor.start()["pid"]
+    deadline = time.monotonic() + 10
+    while psutil.pid_exists(pid) and time.monotonic() < deadline:
+        monitor.snapshot()
+        time.sleep(.05)
+    assert not psutil.pid_exists(pid)
+    assert monitor.snapshot()["phase"] == "exited"
+
+
 @pytest.fixture
 def http_monitor(tmp_path):
     monitor = Monitor(tmp_path, tmp_path / "state", [])
