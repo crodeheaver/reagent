@@ -114,7 +114,9 @@ Synchronous API calls finish or reach their configured transport timeout. SDK
 retries are disabled so they cannot silently spend calls beyond the recorded
 budget. The monitor shows Stopping during cleanup; **Force stop** terminates the
 owned process tree when a request is unresponsive. Ctrl+C/SIGTERM also request
-orderly shutdown in parallel CLI runs. The CLI returns 130 after cancellation.
+orderly shutdown in parallel CLI runs. The CLI returns 130 after cancellation. A
+second Ctrl+C/SIGTERM forces the stop: it kills the run's child processes and exits
+immediately, and the next run resumes the interrupted attempts from their journals.
 
 Authentication failures with explicit HTTP 401/403 status, provider configuration
 failures, and inaccessible backend evidence stop dispatch and record a run-level

@@ -1,6 +1,8 @@
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -96,3 +98,38 @@ def test_api_transports_do_not_hide_retries_from_call_budget(monkeypatch):
         assert constructor.call_args.kwargs["timeout"] == 7
         client.close()
         constructor.return_value.close.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal delivery to self")
+def test_second_interrupt_forces_stop_and_reaps_children(tmp_path):
+    import subprocess
+    import time
+
+    import psutil
+
+    script = tmp_path / "run.py"
+    script.write_text(
+        "import os, signal, subprocess, sys, threading, time\n"
+        "from re_agent.orchestrator.execution import cancellation_signals\n"
+        "cancel = threading.Event()\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+        "print(child.pid, flush=True)\n"
+        "with cancellation_signals(cancel):\n"
+        "    os.kill(os.getpid(), signal.SIGINT)\n"
+        "    time.sleep(.3)\n"
+        "    print('stopping' if cancel.is_set() else 'ignored', flush=True)\n"
+        "    os.kill(os.getpid(), signal.SIGINT)\n"
+        "    time.sleep(30)\n"
+        "print('not forced', flush=True)\n"
+    )
+    started = time.monotonic()
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=20,
+                          env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")})
+    assert time.monotonic() - started < 15
+    assert proc.returncode == 130, proc.stderr
+    pid, state = proc.stdout.split()
+    assert state == "stopping" and "Forced stop" in proc.stderr
+    deadline = time.monotonic() + 5
+    while psutil.pid_exists(int(pid)) and psutil.Process(int(pid)).status() != psutil.STATUS_ZOMBIE:
+        assert time.monotonic() < deadline, "child survived the forced stop"
+        time.sleep(.05)
