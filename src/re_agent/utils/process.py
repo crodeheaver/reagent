@@ -70,7 +70,10 @@ def run_process(
     import os
     import signal
     import tempfile
+    import threading
 
+    if input_text:
+        input_text.encode("utf-8")  # Fail before starting a child that would see truncated input.
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         proc = subprocess.Popen(
             list(args),
@@ -84,6 +87,22 @@ def run_process(
             creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
             start_new_session=os.name != "nt",
         )
+        stdin = proc.stdin
+        assert stdin is not None
+
+        def feed() -> None:
+            try:
+                stdin.write(input_text or "")
+            except OSError:
+                pass  # The child exited or was killed before reading all input.
+            finally:
+                with contextlib.suppress(OSError):
+                    stdin.close()
+
+        # Feed stdin from a thread: communicate() cannot resume a partial write
+        # after the short polling timeouts that keep cancellation responsive.
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
         try:
             import time
 
@@ -91,7 +110,6 @@ def run_process(
 
             context = current()
             deadline = time.monotonic() + timeout_s
-            first = True
             while True:
                 if context:
                     context.check()
@@ -99,11 +117,9 @@ def run_process(
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(args, timeout_s)
                 try:
-                    proc.communicate(input_text if first else None,
-                                     timeout=min(.1, remaining) if context else remaining)
+                    proc.wait(timeout=min(.1, remaining) if context else remaining)
                     break
                 except subprocess.TimeoutExpired:
-                    first = False
                     if not context:
                         raise
         except BaseException:
@@ -126,6 +142,8 @@ def run_process(
                     os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
             raise
+        finally:
+            feeder.join(timeout=1)
 
         def read_tail(handle: object) -> str:
             # Temporary files bound memory even when a build emits a large log.
