@@ -60,8 +60,12 @@ class Monitor:
             if saved.get("command") != self.worker or saved.get("cwd") != str(self.work_dir):
                 return
             process = self.psutil.Process(saved["pid"])
-            if (process.create_time() == saved["created"]
-                    and process.cmdline() == saved.get("process_command", self.worker)):
+            # Launchers may exec another interpreter and rewrite argv on startup.
+            # A per-launch marker survives exec without relaxing PID reuse checks.
+            marker = saved.get("launch_marker")
+            identity_matches = (process.environ().get("RE_AGENT_MONITOR_WORKER") == marker if marker
+                                else process.cmdline() == saved.get("process_command", self.worker))
+            if process.create_time() == saved["created"] and identity_matches:
                 self.process = process
         except (self.psutil.Error, KeyError):
             pass
@@ -84,15 +88,17 @@ class Monitor:
             if self.active():
                 return {"message": "Already running", "pid": self.process.pid}
             self.state_dir.mkdir(parents=True, exist_ok=True)
+            marker = secrets.token_urlsafe(32)
             with (self.state_dir / "worker.stdout.log").open("ab") as out, \
                     (self.state_dir / "worker.stderr.log").open("ab") as err:
                 self.process = self.psutil.Popen(
                     self.worker, cwd=self.work_dir, stdout=out, stderr=err,
+                    env={**os.environ, "RE_AGENT_MONITOR_WORKER": marker},
                     creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
                     start_new_session=os.name != "nt",
                 )
             atomic_json(self.record, {"pid": self.process.pid, "created": self.process.create_time(),
-                                      "command": self.worker, "process_command": self.process.cmdline(),
+                                      "command": self.worker, "launch_marker": marker,
                                       "cwd": str(self.work_dir)})
             return {"message": "Worker started", "pid": self.process.pid}
 
@@ -102,6 +108,9 @@ class Monitor:
         with self.lock, file_lock(self.record):
             self._adopt()
             if self.active():
+                # Provider and compiler CLIs run in their own sessions, outside the
+                # worker's process group; collect them before the worker exits.
+                descendants = self.process.children(recursive=True)
                 if os.name == "nt":
                     subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
                                    capture_output=True, timeout=20, check=True)
@@ -116,6 +125,10 @@ class Monitor:
                     # Descendants can ignore SIGTERM even when the parent exits.
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(self.process.pid, signal.SIGKILL)
+                for child in reversed(descendants):
+                    with contextlib.suppress(self.psutil.Error):
+                        child.kill()
+                self.psutil.wait_procs(descendants, timeout=5)
                 self.process.wait(timeout=20)
             return {"message": "Worker stopped; saved results retained"}
 

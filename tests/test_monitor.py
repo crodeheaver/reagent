@@ -100,6 +100,53 @@ def test_worker_tree_stop_duplicate_start_and_host_reconnect(tmp_path):
             second.stop()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="taskkill /T already stops the whole tree")
+def test_stop_kills_descendants_in_their_own_session(tmp_path):
+    # Provider and compiler CLIs run in a new session (utils.process.run_bounded),
+    # so signalling only the worker's process group would leave them running.
+    script = tmp_path / "worker.py"
+    script.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
+        "                         start_new_session=True)\n"
+        "pathlib.Path('child.pid').write_text(str(child.pid))\n"
+        "time.sleep(120)\n", encoding="utf-8")
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, str(script)])
+    child = None
+    try:
+        monitor.start()
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "child.pid").exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        child = psutil.Process(int((tmp_path / "child.pid").read_text()))
+        monitor.stop()
+        deadline = time.monotonic() + 5
+        while child.is_running() and child.status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+    finally:
+        monitor.stop()
+        if child is not None and child.is_running():
+            child.kill()
+
+
+def test_adoption_uses_launch_marker_even_if_launcher_changes_argv(tmp_path):
+    command = [sys.executable, "-c", "import time; time.sleep(120)"]
+    first = Monitor(tmp_path, tmp_path / "state", [], worker=command)
+    try:
+        first.start()
+        saved = json.loads(first.record.read_text())
+        saved["process_command"] = ["a-transient-launcher", "different-argv"]
+        first.record.write_text(json.dumps(saved))
+        adopted = Monitor(tmp_path, tmp_path / "state", [], worker=command)
+        assert adopted.active()
+        saved["launch_marker"] = "unrelated-launch"
+        first.record.write_text(json.dumps(saved))
+        assert not Monitor(tmp_path, tmp_path / "state", [], worker=command).active()
+    finally:
+        first.stop()
+
+
 def test_stale_identity_and_unrelated_process_are_not_adopted(tmp_path):
     state = tmp_path / "state"
     state.mkdir()

@@ -33,9 +33,9 @@ re-agent monitor --work-dir /path/to/project --session-glob re-agent-progress.js
 On Windows, quote paths containing spaces and use an executable such as `python.exe` or `re-agent.exe`, rather than a shell script. Worker arguments are passed directly, without shell interpretation.
 
 - **Start / resume** launches the configured command. Resuming completed work depends on that command's checkpoint behavior. ReAgent uses its configured session and attempt limits; the monitor does not reset them.
-- **Stop run** terminates the owned worker process tree. Saved session files remain intact. An interrupted model call may need to be repeated.
+- **Stop run** terminates the owned worker process tree, including provider and compiler CLIs that run in their own sessions. Saved session files remain intact. An interrupted model call may need to be repeated.
 - Closing the browser or monitor host leaves the worker running. Restart the monitor with the same work directory, state directory and worker command to reconnect.
-- Duplicate starts sharing a state directory are protected by a process lock. Adoption checks the command, working directory record, PID and process creation time, so stale PID records do not attach to unrelated processes.
+- Duplicate starts sharing a state directory are protected by a process lock. Adoption checks the command, working directory record, PID, process creation time and a per-launch marker in the worker's environment, so stale PID records do not attach to unrelated processes and launchers that re-exec themselves are still recognised.
 
 Control records and worker stdout/stderr live in `reports/monitor` by default; override with `--state-dir`. Treat these as local run artifacts, not source files. `--port` changes the port; zero selects an available port.
 
