@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,7 +21,15 @@ def atomic_json(path: Path, data: Any) -> None:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(name, path)
+        for attempt in range(10):
+            try:
+                os.replace(name, path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process is reading; readers close quickly.
+                if attempt == 9:
+                    raise
+                time.sleep(.05)
     finally:
         Path(name).unlink(missing_ok=True)
 

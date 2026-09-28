@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -189,6 +189,11 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
     import psutil
 
     created = psutil.Process().create_time()
+    status_data: dict[str, Any] = {}
+
+    def write_status() -> None:
+        with suppress(PermissionError):  # Advisory status; a reader holding it must not stop the run.
+            atomic_json(status, status_data)
 
     def save(changed: str | None = None) -> None:
         if changed is not None:
@@ -196,7 +201,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         active = {v["address"] for v in jobs.values() if v["state"] in {"running", "proposed"}}
         visible = [v for v in jobs.values() if v["state"] in {"running", "proposed"}]
         visible += [v for v in jobs.values() if v["state"] not in {"running", "proposed"}][-32:]
-        atomic_json(status, {"schema_version": 1, "phase": "stopping" if cancel.is_set() else "running",
+        status_data.update({"schema_version": 1, "phase": "stopping" if cancel.is_set() else "running",
             "pid": os.getpid(), "created": created, "run_id": root.name,
             "limit": config.orchestrator.max_parallel_functions, "requests": requests.snapshot(),
             "queued": sum(a not in completed and a not in active and
@@ -205,6 +210,7 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
             "counts": {state: sum(v["state"] == state for v in jobs.values())
                        for state in ("running", "proposed", "completed", "failed", "interrupted")},
             "updated": time.time(), "error": failure, "stop_file": str(stop.resolve())})
+        write_status()
 
     def publish(job: str, result: ReversalResult) -> None:
         # Journal first, then idempotent session publication: recovery can finish
@@ -416,7 +422,6 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
             if value["state"] == "interrupted":
                 save(value["id"])
         save()
-        data = json.loads(status.read_text())
-        data["phase"] = "failed" if failure else "stopped" if cancel.is_set() else "complete"
-        atomic_json(status, data)
+        status_data["phase"] = "failed" if failure else "stopped" if cancel.is_set() else "complete"
+        write_status()
     return sorted(results, key=lambda r: (rank[normalize_address(r.target.address)], jobs[r.run_id]["sequence"]))

@@ -196,6 +196,23 @@ def test_resumed_job_with_artifacts_runs_real_pipeline_without_empty_feedback(tm
     assert prompts and "Previous attempt checkpoint" not in prompts[0]
 
 
+def test_locked_status_file_does_not_stop_the_run(setup, monkeypatch):
+    from re_agent.utils.storage import atomic_json
+
+    config, backend, targets, session = setup
+
+    def status_locked(path, data):
+        if path.name.endswith(".execution.json"):
+            raise PermissionError(13, "held open by the monitor")
+        atomic_json(path, data)
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.atomic_json", status_locked)
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single",
+                        lambda target, *args, **kwargs: ReversalResult(target, "ok", success=True))
+    assert len(reverse_parallel(targets, config, backend, session, lambda c: Mock(), 4)) == 4
+    assert all(session.is_completed(t.address) for t in targets)
+
+
 def test_competing_coordinator_lease(setup, monkeypatch):
     config, backend, targets, session = setup
     entered, release = threading.Event(), threading.Event()
