@@ -226,7 +226,10 @@ def _run(targets: list[FunctionTarget], config: ReAgentConfig, backend: REBacken
         results.append(result)
 
     for value in jobs.values():
-        # Proposals are finished attempts whose promotion or publication a stop deferred.
+        # Proposals are finished attempts whose promotion or publication a stop deferred;
+        # another target set's proposals wait for a run whose scratch project they belong to.
+        if value["state"] == "proposed" and value.get("result") and value["address"] not in by_address:
+            continue
         if value["state"] in {"completed", "failed", "proposed"} and value.get("result"):
             recovered = decode_result(value["result"])
             changed = value["state"] == "proposed"

@@ -196,6 +196,28 @@ def test_resumed_job_with_artifacts_runs_real_pipeline_without_empty_feedback(tm
     assert prompts and "Previous attempt checkpoint" not in prompts[0]
 
 
+def test_deferred_proposal_waits_for_its_own_target_set(setup, monkeypatch, tmp_path):
+    config, backend, targets, session = setup
+    config.validation.project_root = str(tmp_path)
+    Path(config.project_profile.source_root).mkdir()
+    cancel = threading.Event()
+
+    def stopped(result, view):
+        cancel.set()
+        current().check()
+
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single",
+                        lambda target, *args, **kwargs: ReversalResult(target, "ok", success=True))
+    assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, cancel=cancel,
+                            promote=stopped) == []
+    assert len(reverse_parallel(targets[1:2], config, backend, session, lambda c: Mock(), 1,
+                                promote=lambda r, v: r)) == 1
+    assert not session.is_completed(targets[0].address)
+    monkeypatch.setattr("re_agent.orchestrator.parallel.reverse_single", Mock(side_effect=AssertionError))
+    assert reverse_parallel(targets[:1], config, backend, session, lambda c: Mock(), 1, promote=lambda r, v: r) == []
+    assert session.is_completed(targets[0].address) and session.attempt_count(targets[0].address) == 1
+
+
 def test_locked_status_file_does_not_stop_the_run(setup, monkeypatch):
     from re_agent.utils.storage import atomic_json
 
