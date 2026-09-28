@@ -614,7 +614,9 @@
         const source = el("batch-select").value;
         if (!source) return;
         try {
-          const response = await fetch(`/api/agent-history?source=${encodeURIComponent(source)}`);
+          const response = await fetch(`/api/agent-history?source=${encodeURIComponent(source)}`, {
+            headers: { "X-Control-Token": token },
+          });
           if (!response.ok) throw Error("Cannot load agent history");
           const history = await response.json();
           if (el("batch-select").value !== source) return;

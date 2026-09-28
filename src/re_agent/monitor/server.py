@@ -23,6 +23,8 @@ from re_agent.utils.storage import atomic_json, file_lock
 STALE_AFTER_S = 60
 # Snapshot fields that change with the clock alone; streamed as small ticks, not full updates.
 VOLATILE = ("updated", "data_age_s", "details")
+# Each live stream holds a thread polling snapshots; a few tabs are plenty for a local dashboard.
+MAX_STREAMS = 16
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -423,6 +425,10 @@ class StreamDiff:
 def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
     """Bind only loopback; never accept worker commands from HTTP clients."""
     token = secrets.token_urlsafe(32)
+    streams = threading.BoundedSemaphore(MAX_STREAMS)
+
+    def has_token(value: str | None) -> bool:
+        return value is not None and secrets.compare_digest(value.encode("latin-1", "replace"), token.encode())
 
     class Handler(BaseHTTPRequestHandler):
         server: ThreadingHTTPServer
@@ -441,12 +447,22 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
         def valid_host(self) -> bool:
             return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
 
+        def may_read(self) -> bool:
+            # Any site can make a browser send simple GETs to loopback. Data endpoints answer
+            # only this page (same-origin fetch metadata) or holders of the page's token.
+            return (has_token(self.headers.get("X-Control-Token"))
+                    or self.headers.get("Sec-Fetch-Site") == "same-origin")
+
         def do_GET(self) -> None:
             if not self.valid_host():
                 self.reply(403, '{"error":"Invalid host"}')
             elif self.path == "/":
                 html = Path(__file__).with_name("index.html").read_text(encoding="utf-8")
                 self.reply(200, html.replace("__TOKEN__", token), "text/html")
+            elif self.path == "/api/stream":
+                self.stream()  # Browsers cannot forge the Origin that the upgrade checks.
+            elif self.path.startswith("/api/") and not self.may_read():
+                self.reply(403, '{"error":"Data request rejected"}')
             elif self.path == "/api/status":
                 try:
                     body = json.dumps(monitor.snapshot())
@@ -454,8 +470,6 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                     self.reply(503, json.dumps({"error": f"Monitor state unavailable: {exc}"}))
                     return
                 self.reply(200, body)
-            elif self.path == "/api/stream":
-                self.stream()
             elif urlsplit(self.path).path == "/api/agent-history":
                 source = parse_qs(urlsplit(self.path).query).get("source", [""])[0]
                 allowed = {str(p.relative_to(monitor.work_dir)).replace("\\", "/"): p
@@ -487,6 +501,9 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
             origin = f"http://127.0.0.1:{self.server.server_port}"
             if self.headers.get("Origin") != origin or self.headers.get("Upgrade", "").lower() != "websocket":
                 self.reply(403, '{"error":"Stream request rejected"}')
+                return
+            if not streams.acquire(blocking=False):
+                self.reply(503, '{"error":"Too many live streams; close another monitor tab"}')
                 return
             ws = WSConnection(ConnectionType.SERVER)
             self.close_connection = True
@@ -523,11 +540,13 @@ def make_server(monitor: Monitor, port: int = 8765) -> ThreadingHTTPServer:
                                 return
             except (OSError, ProtocolError, ValueError):
                 return
+            finally:
+                streams.release()
 
         def do_POST(self) -> None:
             origin = f"http://127.0.0.1:{self.server.server_port}"
             if (not self.valid_host() or self.headers.get("Origin") not in (None, origin)
-                    or self.headers.get("X-Control-Token") != token):
+                    or not has_token(self.headers.get("X-Control-Token"))):
                 self.reply(403, '{"error":"Control request rejected"}')
                 return
             try:

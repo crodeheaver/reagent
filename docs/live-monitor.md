@@ -46,7 +46,7 @@ Control records and worker stdout/stderr live in `reports/monitor` by default; o
 
 ## Local access
 
-The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
+The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. The data endpoints (`/api/status`, `/api/agent-history`) answer only the dashboard page itself (same-origin fetch metadata) or requests carrying that token, so other websites cannot make the monitor read logs on their behalf. The live stream accepts only the dashboard's own origin, and at most 16 streams (browser tabs) at once. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
 # External batch progress
 
 Use the existing dashboard for a separately launched batch runner:

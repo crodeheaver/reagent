@@ -92,10 +92,13 @@ def test_stream_rejects_foreign_origin_and_history_cannot_escape(tmp_path):
             urllib.request.urlopen(request)
         assert error.value.code == 403
         with pytest.raises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(base + "/api/agent-history?source=../secret.jsonl")
+            urllib.request.urlopen(urllib.request.Request(base + "/api/agent-history?source=../secret.jsonl",
+                                                          headers={"Sec-Fetch-Site": "same-origin"}))
         assert error.value.code == 404
         (tmp_path / "test.jsonl").write_text('{"type":"text","data":"<script>inert</script>"}\n')
-        with urllib.request.urlopen(base + "/api/agent-history?source=test.jsonl") as response:
+        request = urllib.request.Request(base + "/api/agent-history?source=test.jsonl",
+                                         headers={"Sec-Fetch-Site": "same-origin"})
+        with urllib.request.urlopen(request) as response:
             assert json.load(response)["agents"][0]["text"] == "<script>inert</script>"
     finally:
         server.shutdown()
@@ -261,3 +264,33 @@ def test_stream_diff_sends_changed_fields_and_agents_only():
     assert message["removed"] == ["phase"]
     assert message["agents"]["order"] == ["a1", "a2"]
     assert [agent["id"] for agent in message["agents"]["changed"]] == ["a1"]
+
+
+def test_live_streams_are_capped(tmp_path):
+    from re_agent.monitor.server import MAX_STREAMS
+
+    server = make_server(Monitor(tmp_path, tmp_path / "state", []), 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sockets = []
+    try:
+        for _ in range(MAX_STREAMS):
+            sock, ws = open_stream(server)
+            sockets.append(sock)
+            assert stream_messages(sock, ws, .3)[0][1]["type"] == "snapshot"
+        sock, _ws = open_stream(server)
+        sockets.append(sock)
+        sock.settimeout(5)
+        assert sock.recv(4096).startswith(b"HTTP/1.0 503")
+        sockets.pop().close()
+        sockets.pop().close()
+        time.sleep(1)  # The server notices the closed stream on its next poll.
+        sock, ws = open_stream(server)
+        sockets.append(sock)
+        assert stream_messages(sock, ws, .5)[0][1]["type"] == "snapshot"
+    finally:
+        for sock in sockets:
+            sock.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

@@ -314,9 +314,32 @@ def test_http_serves_packaged_ui_and_read_only_status(http_monitor):
         assert "Reconstruction, live." in html
         assert "__TOKEN__" not in html
         assert response.headers["Cache-Control"] == "no-store"
-    with urllib.request.urlopen(url + "/api/status") as response:
+    token = re.search(r'const token = "([^"]+)"', html).group(1)
+    request = urllib.request.Request(url + "/api/status", headers={"X-Control-Token": token})
+    with urllib.request.urlopen(request) as response:
         state = json.load(response)
         assert not state["controls"]
+
+
+@pytest.mark.parametrize(("path", "headers", "allowed"), [
+    ("/api/status", {}, False),
+    ("/api/status", {"X-Control-Token": "wrong"}, False),
+    ("/api/status", {"Sec-Fetch-Site": "cross-site"}, False),
+    ("/api/status", {"Sec-Fetch-Site": "same-origin"}, True),
+    ("/api/agent-history?source=x", {}, False),
+    ("/api/agent-history?source=x", {"Sec-Fetch-Site": "same-site"}, False),
+])
+def test_data_endpoints_require_the_page_or_its_token(http_monitor, path, headers, allowed):
+    # A cross-site page can make the browser send these GETs; they must not do work for it.
+    _, url = http_monitor
+    request = urllib.request.Request(url + path, headers=headers)
+    if allowed:
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+    else:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 403
 
 
 @pytest.mark.parametrize("headers", [{}, {"X-Control-Token": "wrong"}, {"Host": "untrusted.example"}])
