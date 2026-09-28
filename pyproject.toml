@@ -45,7 +45,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-monitor = ["psutil>=7.0"]
+# psutil and wsproto are core dependencies; the empty extra keeps older install commands working.
+monitor = []
 ghidra-bridge = ["ghidra-ai-bridge>=0.2.0"]
 headless = ["ghidra-ai-bridge[headless]>=0.2.0"]
 benchmark = ["pefile>=2024.8.26", "unicorn>=2.1"]

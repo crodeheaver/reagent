@@ -506,3 +506,10 @@ def test_stop_reports_a_worker_that_will_not_exit(tmp_path, monkeypatch):
     finally:
         process.kill()
         process.wait(timeout=10)
+
+
+def test_monitor_dependencies_are_core_and_the_extra_still_installs():
+    tomllib = pytest.importorskip("tomllib")
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert {dep.split(">")[0].split("=")[0] for dep in project["dependencies"]} >= {"psutil", "wsproto"}
+    assert "monitor" in project["optional-dependencies"]  # `pip install auto-re-agent[monitor]` keeps working

@@ -23,11 +23,8 @@ The monitor deduplicates function addresses across matching files using their la
 
 ## Optional worker controls
 
-Install the optional process-management dependency:
-
-```sh
-pip install 'auto-re-agent[monitor]'
-```
+Worker controls need no extra install: `psutil` and `wsproto` are core dependencies.
+The `auto-re-agent[monitor]` extra is kept, empty, so older install commands still work.
 
 Supply an explicit argument array after `--worker`, which must be the last monitor option:
 
@@ -47,9 +44,13 @@ Control records and worker stdout/stderr live in `reports/monitor` by default; o
 ## Local access
 
 The server binds only to IPv4 loopback. Host-header checks reject DNS-rebinding requests. Control endpoints require a random per-host token and reject cross-origin requests. The data endpoints (`/api/status`, `/api/agent-history`) answer only the dashboard page itself (same-origin fetch metadata) or requests carrying that token, so other websites cannot make the monitor read logs on their behalf. The live stream accepts only the dashboard's own origin, and at most 16 streams (browser tabs) at once. HTTP clients cannot supply a different worker command or arbitrary file path. No external scripts, fonts, telemetry or services are used by the dashboard. This is a local tool, not a multi-user network service.
-# External batch progress
 
-Use the existing dashboard for a separately launched batch runner:
+## External batch progress
+
+`--progress-file`, `--stop-file` and `--event-glob` are for a separately launched
+batch runner, such as a script that drives native Grok subagents. `re-agent reverse`
+does not write these files; for its own runs, use `--session-glob` and `--log-glob`.
+Use the existing dashboard for such a runner:
 
 ```console
 re-agent monitor --work-dir /path/to/run --progress-file status.json --stop-file STOP --log-glob "batch-*/stderr.log"

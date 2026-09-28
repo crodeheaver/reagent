@@ -67,13 +67,7 @@ class Monitor:
         self.worker = worker or []
         self.record = self.state_dir / "worker.json"
         self.process: Any = None
-        self.psutil: Any = None
-        if self.worker:
-            try:
-                import psutil
-            except ImportError as exc:
-                raise RuntimeError("Worker controls require: pip install 'auto-re-agent[monitor]'") from exc
-            self.psutil = psutil
+        self.psutil: Any = psutil
         self.lock = threading.RLock()
         # Start/stop wait for processes; a separate lock keeps snapshots and streams live meanwhile.
         self.control = threading.Lock()
