@@ -352,6 +352,7 @@ Global options must precede the subcommand, for example
 |---|---|
 | `re-agent init --profile generic-cpp` | Create `re-agent.yaml` from a profile |
 | `re-agent reverse --address ADDR` | Reverse one function |
+| `re-agent reverse --address ADDR --class CLASS --function NAME` | Reverse one function with known source identity |
 | `re-agent reverse --class CLASS --max-functions N` | Reverse a bounded class batch |
 | `re-agent reverse --class CLASS --dry-run` | Show a target plan without LLM calls |
 | `re-agent reverse ... --max-rounds N --skip-parity` | Override loop/parity behavior |

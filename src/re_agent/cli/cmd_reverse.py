@@ -18,6 +18,8 @@ def cmd_reverse(args: argparse.Namespace) -> int:
         raise ValueError("--manifest cannot be combined with --address or --class")
     if args.max_functions is not None and args.max_functions < 1:
         raise ValueError("--max-functions must be positive")
+    if getattr(args, "function_name", None) and not args.address:
+        raise ValueError("--function requires --address")
     if not args.address and not args.class_name and not manifest_path:
         print("Error: specify --address, --class, or --manifest", file=sys.stderr)
         return 1
@@ -67,12 +69,14 @@ def cmd_reverse(args: argparse.Namespace) -> int:
         from re_agent.orchestrator.single import reverse_single
 
         class_name = args.class_name or ""
-        function_name = ""
+        function_name = args.function_name or ""
 
+        # Explicit --class/--function win; the decompiler and project hooks only
+        # fill in identity the caller did not supply.
         dec = backend.decompile(args.address)
         if dec.name:
-            resolved_class, _, function_name = dec.name.rpartition("::")
-            function_name = function_name or dec.name
+            resolved_class, _, resolved_function = dec.name.rpartition("::")
+            function_name = function_name or resolved_function or dec.name
             class_name = class_name or resolved_class
         # Project hooks provide identity when legacy decompilation uses FUN_* names.
         from re_agent.parity.source_indexer import SourceIndexer
@@ -81,8 +85,8 @@ def cmd_reverse(args: argparse.Namespace) -> int:
         source_index = SourceIndexer(Path(config.project_profile.source_root), config.project_profile)
         for address, (hook_class, hook_name) in source_index.hook_address_index.items():
             if normalize_address(address) == normalize_address(args.address):
-                class_name = hook_class or class_name
-                function_name = hook_name
+                class_name = args.class_name or hook_class or class_name
+                function_name = args.function_name or hook_name
                 break
 
         target = FunctionTarget(
@@ -152,6 +156,8 @@ def _dry_run(args: argparse.Namespace, config: ReAgentConfig) -> int:
         print(f"Would reverse: {args.address}")
         if args.class_name:
             print(f"  Class: {args.class_name}")
+        if args.function_name:
+            print(f"  Function: {args.function_name}")
         return 0
 
     if args.class_name:
