@@ -122,6 +122,26 @@ def test_managed_batch_resume_clears_stop_and_prevents_duplicate(tmp_path):
             monitor.process.wait(timeout=5)
 
 
+@pytest.mark.parametrize(("fields", "blocked"), [
+    ({"created": "actual"}, True), ({"created": 0}, False),
+    ({"updated": "now"}, True), ({"updated": "stale"}, False), ({}, False),
+])
+def test_managed_start_checks_recorded_pid_identity(tmp_path, fields, blocked):
+    # The progress file names a live PID (this test process), as a reused PID would.
+    current = psutil.Process()
+    values = {"actual": current.create_time(), "now": time.time(), "stale": time.time() - 120}
+    progress = {"pid": current.pid, **{key: values.get(value, value) for key, value in fields.items()}}
+    (tmp_path / "status.json").write_text(json.dumps(progress))
+    monitor = Monitor(tmp_path, tmp_path / "state", [], worker=[sys.executable, "-c", "pass"],
+                      progress_file="status.json", stop_file="STOP")
+    if blocked:
+        with pytest.raises(ValueError, match="duplicate launch"):
+            monitor.start()
+    else:
+        assert monitor.start()["message"] == "Worker started"
+        monitor.process.wait(timeout=10)
+
+
 def test_worker_tree_stop_duplicate_start_and_host_reconnect(tmp_path):
     script = tmp_path / "worker with spaces.py"
     script.write_text(

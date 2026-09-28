@@ -55,14 +55,18 @@ or restart the external process. Stop creates the configured cooperative signal;
 the runner must watch it and cancel its own children. Omit `--stop-file` for
 read-only reporting. To enable Start / resume, also configure `--worker` (last option) and `--stop-file`.
 The monitor clears the stop signal before launching its managed worker and refuses
-a duplicate launch while the recorded process exists. The runner must implement
-checkpoint recovery; the monitor does not reinterpret its saved work.
+a duplicate launch while the process recorded in the progress file still exists. The
+runner should record its `pid` and, to guard against PID reuse, its process `created`
+time as reported by `psutil.Process().create_time()`. Without `created`, the PID only
+blocks a launch while the progress file is fresh (updated within 60 seconds). The runner
+must implement checkpoint recovery; the monitor does not reinterpret its saved work.
 
 The progress JSON uses `phase`, Unix-second `started`, `updated` and
 `batch_started` timestamps, and integer `total`, `completed`, `compiled`, `failed`,
 `verified`, `batch`, `batches`, `child_started`, `child_returned` and
 `active_children` counters. `recent` contains rows with `address`, `compiled` and
-optional `diagnostic`; optional `error` describes a run-level failure.
+optional `diagnostic`; optional `error` describes a run-level failure. Optional `pid`
+and `created` identify the runner process, as described above.
 Active phases are `opening-analysis`, `exporting-evidence`, `native-subagents` and
 `validating-candidates`. Updates older than 60 seconds are marked stale; this is
 a freshness indication, not proof that a process has exited.

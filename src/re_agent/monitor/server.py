@@ -19,6 +19,9 @@ import psutil
 from re_agent.monitor.events import AgentEvents
 from re_agent.utils.storage import atomic_json, file_lock
 
+# External progress older than this is shown as stale and no longer vouches for its PID.
+STALE_AFTER_S = 60
+
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
@@ -120,11 +123,8 @@ class Monitor:
             self._adopt()
             if self.active():
                 return {"message": "Already running", "pid": self.process.pid}
-            if self.progress_file:
-                saved_progress = read_json(self.progress_file)
-                pid = saved_progress.get("pid")
-                if type(pid) is int and self.psutil.pid_exists(pid):
-                    raise ValueError("A recorded external worker still exists; refusing a duplicate launch")
+            if self.progress_file and self.external_worker_alive():
+                raise ValueError("A recorded external worker still exists; refusing a duplicate launch")
             if self.stop_file:
                 if not self.stop_file.resolve().is_relative_to(self.work_dir):
                     raise ValueError("Stop file escaped the working directory")
@@ -143,6 +143,23 @@ class Monitor:
                                       "command": self.worker, "launch_marker": marker,
                                       "cwd": str(self.work_dir), "phase": "running"})
             return {"message": "Worker started", "pid": self.process.pid}
+
+    def external_worker_alive(self) -> bool:
+        """Whether the progress file's PID is still its writer, not a reused PID."""
+        progress = read_json(self.progress_file) if self.progress_file else {}
+        pid, created, updated = progress.get("pid"), progress.get("created"), progress.get("updated")
+        if type(pid) is not int or pid <= 0:
+            return False
+        try:
+            process = psutil.Process(pid)
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False
+            if isinstance(created, (int, float)):
+                return bool(abs(process.create_time() - created) < 1e-3)
+        except psutil.Error:
+            return False
+        # Without a creation time the PID may belong to another process; trust it only while fresh.
+        return isinstance(updated, (int, float)) and 0 <= time.time() - updated < STALE_AFTER_S
 
     def executions(self) -> list[tuple[Path, dict[str, Any]]]:
         """Read adjacent status files, verifying PID birth time before displaying activity."""
@@ -308,7 +325,7 @@ class Monitor:
             return max(0, value) if type(value) is int else 0
         phase = str(data.get("phase", "waiting-for-progress"))
         updated = data.get("updated")
-        fresh = isinstance(updated, (int, float)) and 0 <= time.time() - updated < 60
+        fresh = isinstance(updated, (int, float)) and 0 <= time.time() - updated < STALE_AFTER_S
         running_phases = {"opening-analysis", "exporting-evidence", "native-subagents", "validating-candidates"}
         active = fresh and phase in running_phases
         if self.worker:
