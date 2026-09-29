@@ -27,6 +27,8 @@ def cmd_reverse(args: argparse.Namespace) -> int:
 
     if args.max_rounds is not None:
         config.orchestrator.max_review_rounds = args.max_rounds
+    if getattr(args, "max_match_rounds", None) is not None:
+        config.matching.max_rounds = args.max_match_rounds
     if args.skip_parity:
         config.parity.enabled = False
 
@@ -55,7 +57,8 @@ def cmd_reverse(args: argparse.Namespace) -> int:
     validation = config.validation
     if validation.enabled and validation.require_verified:
         commands = validation.build_commands + validation.test_commands + validation.runtime_commands
-        if not (commands or validation.differential_cases_file) or not validation.trust_configured_commands:
+        oracle = config.matching.enabled and config.matching.oracle_command
+        if not (commands or validation.differential_cases_file or oracle) or not validation.trust_configured_commands:
             raise ValueError("Verified reversal requires configured trusted validation gates; run re-agent doctor")
 
     # Lazy imports to avoid loading LLM/backend unless needed

@@ -102,8 +102,20 @@ class Session:
 
     def record_result(self, result: ReversalResult, *, idempotent: bool = False) -> None:
         addr = normalize_address(result.target.address)
+        entry = self._entry(result)
+        with file_lock(self.path):
+            if self.path.exists():
+                self.load()
+            if idempotent and result.run_id and any(r.get("run_id") == result.run_id for r in self._data["runs"]):
+                return
+            self._data["functions"][addr] = entry
+            self._data["runs"].append(entry)
+            self.save()
+
+    @staticmethod
+    def _entry(result: ReversalResult) -> dict[str, Any]:
         code = result.code or ""
-        entry = {
+        return {
             "address": result.target.address,
             "run_id": result.run_id,
             "error": result.error,
@@ -121,15 +133,28 @@ class Session:
             "verdict": result.checker_verdict.verdict.value if result.checker_verdict else None,
             "validation_verdict": (result.validation_verdict.verdict.value if result.validation_verdict else None),
             "parity_status": result.parity_status.value if result.parity_status else None,
+            "match": asdict(result.match_verdict) if result.match_verdict else None,
+            "match_tier": result.match_tier if result.match_verdict else None,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+
+    def amend_result(self, result: ReversalResult) -> None:
+        """Replace this run's recorded outcome, for example after a reverted promotion.
+
+        The attempt was already counted; amending must not consume another one.
+        """
+        entry = self._entry(result)
         with file_lock(self.path):
             if self.path.exists():
                 self.load()
-            if idempotent and result.run_id and any(r.get("run_id") == result.run_id for r in self._data["runs"]):
-                return
-            self._data["functions"][addr] = entry
-            self._data["runs"].append(entry)
+            runs = self._data["runs"]
+            for index in range(len(runs) - 1, -1, -1):
+                if result.run_id and runs[index].get("run_id") == result.run_id:
+                    runs[index] = entry
+                    break
+            else:
+                runs.append(entry)
+            self._data["functions"][normalize_address(result.target.address)] = entry
             self.save()
 
     def is_completed(self, address: str) -> bool:
@@ -177,12 +202,15 @@ class Session:
             cn = f.get("class_name", "")
             if cn:
                 classes.add(cn)
-        return {
+        summary: dict[str, Any] = {
             "total_functions": total,
             "passed": passed,
             "failed": failed,
             "classes_touched": len(classes),
         }
+        if any(f.get("match") for f in funcs.values()):
+            summary["exact_matches"] = sum(1 for f in funcs.values() if f.get("match_tier") == "exact")
+        return summary
 
     def get_all_functions(self) -> list[dict[str, Any]]:
         return list(self._data["functions"].values())

@@ -106,7 +106,7 @@ orchestrator:
   objective_control_flow_tolerance: 2
   investigation_enabled: true
   max_investigations: 8
-  selection_strategy: dependency-order # dependency-order | easiest-first | high-impact
+  selection_strategy: dependency-order # dependency-order | easiest-first | high-impact | smallest-first
   max_attempts_per_function: 3
 ```
 
@@ -149,6 +149,37 @@ inspecting their text. They therefore produce `UNKNOWN` until
 `trust_configured_commands: true` explicitly attests that the configured
 project commands compile/test the candidate. The non-isolated placeholder
 check is an additional mistake detector, not a semantic proof.
+
+## Matching Config
+
+Byte-identical (matching) decompilation compiles each candidate with the original
+toolchain through a project-owned oracle and accepts only exact matches by default.
+It requires `validation.enabled`; trusted commands make exact matches count.
+
+```yaml
+matching:
+  enabled: false
+  oracle_command: []          # argument array printing one JSON comparison
+  original_binary: null
+  toolchain_files: []         # hashed into the project fingerprint
+  require_exact: true
+  max_rounds: 30              # score-guided refinement rounds; 0 disables
+  plateau_rounds: 6
+  candidates_per_round: 1     # 1-8
+  diff_max_lines: 120
+  prompt_hints: []
+  forbidden_patterns: [...]   # defaults reject inline asm, emitted bytes and pragmas
+  permuter_command: []
+  permuter_threshold: 0.9
+  permuter_timeout_s: 600
+  unit_regression: true
+  canary_address: null
+  canary_function: null
+  timeout_s: 300
+```
+
+See [matching decompilation](matching.md) for the oracle contract, the refinement
+phase, and the `toolchain` and `match-binary` commands.
 
 
 ## Version 0.3 options and migration

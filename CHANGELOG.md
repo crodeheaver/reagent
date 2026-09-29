@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Byte-identical (matching) decompilation
+
+- Add `matching` configuration and a project-owned match oracle contract: compile each overlaid candidate with the original toolchain and compare it with the original bytes. An exact match with trusted commands is accepted without model review.
+- Refine functional or best-scoring candidates in a score-guided phase. Each round is a fresh bounded prompt with the best candidate, the oracle diff, the original disassembly, and an attempt log. The best score is kept, and the phase stops on a plateau, round limit, or call budget. Exact results are confirmed against every configured gate.
+- Reject inline assembly, emitted bytes, pragmas and code-generation attributes before compiling. Feed oracle compiler errors to repair without a checker call.
+- Optionally hand plateaued candidates above a threshold to a permuter; its proposals are re-scored by the oracle.
+- Revert cumulative promotions that change previously exact functions in the same file.
+- Add `re-agent toolchain` (PE linker/Rich header and ELF `.comment` identification, compiler-flag search via `RE_AGENT_MATCH_FLAGS`) and `re-agent match-binary` (whole-binary comparison masking only build-varying fields).
+- Add a doctor canary that compiles a known-matching function before model calls, `smallest-first` selection, `--max-match-rounds`, and exact/functional tiers with byte-weighted progress in `status`.
+- Add a reference GCC/Clang ELF oracle using GNU binutils in `examples/matching_elf`.
+
+### Fixes
+
+- Extract ```` ```c ```` fenced code blocks from model responses, not only C++ fences.
+- Mark a class-run candidate as failed when promotion into the scratch project is refused, instead of aborting the run.
+
 ## 0.4.0 — 2026-09-09
 
 ### Portable validation

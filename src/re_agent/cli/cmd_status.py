@@ -36,8 +36,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if not rows:
             print("No functions recorded yet.")
             return 0
-        print("| Address | Class | Function | Status | Rounds | Time |")
-        print("|---------|-------|----------|--------|--------|------|")
+        print("| Address | Class | Function | Status | Rounds | Match | Time |")
+        print("|---------|-------|----------|--------|--------|-------|------|")
         for r in rows:
             addr = r['address']
             cls = r['class']
@@ -45,7 +45,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             st = r['status']
             rds = r['rounds']
             ts = r['timestamp']
-            print(f"| {addr} | {cls} | {fn} | {st} | {rds} | {ts} |")
+            print(f"| {addr} | {cls} | {fn} | {st} | {rds} | {r['match']} | {ts} |")
         return 0
 
     # Default: text format
@@ -54,7 +54,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         rows = tracker.get_function_table(args.class_name)
         for r in rows:
-            print(f"  {r['address']}  {r['function']:40s}  {r['status']:4s}  ({r['rounds']} rounds)")
+            match = f"  match {r['match']}" if r["match"] != "-" else ""
+            print(f"  {r['address']}  {r['function']:40s}  {r['status']:4s}  ({r['rounds']} rounds){match}")
     else:
         print(tracker.print_summary())
 

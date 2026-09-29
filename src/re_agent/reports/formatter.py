@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Any
 
 from re_agent.core.models import ReversalResult
@@ -43,6 +44,10 @@ def format_result(result: ReversalResult, include_code: bool = True) -> str:
     if result.parity_findings:
         for f in result.parity_findings:
             lines.append(f"    [{f.level}] {f.reason}")
+    if result.match_verdict:
+        lines.append(f"  Match: {match_label(result)} | {result.match_verdict.summary}")
+        for line in [*result.match_verdict.violations, *result.match_verdict.diff[:10]]:
+            lines.append(f"    {line}")
     if include_code and result.code:
         lines.append("  Code:")
         lines.append("  ```cpp")
@@ -61,15 +66,26 @@ def results_to_json(results: list[ReversalResult]) -> str:
 def results_to_markdown(results: list[ReversalResult]) -> str:
     """Format results as a markdown table."""
     lines = [
-        "| Address | Function | Status | Rounds | Parity |",
-        "|---------|----------|--------|--------|--------|",
+        "| Address | Function | Status | Rounds | Parity | Match |",
+        "|---------|----------|--------|--------|--------|-------|",
     ]
     for r in results:
         status = "PASS" if r.success else "FAIL"
         parity = r.parity_status.value if r.parity_status else "-"
         fn = f"{r.target.class_name}::{r.target.function_name}"
-        lines.append(f"| {r.target.address} | {fn} | {status} | {r.rounds_used} | {parity} |")
+        lines.append(f"| {r.target.address} | {fn} | {status} | {r.rounds_used} | {parity} | {match_label(r)} |")
     return "\n".join(lines)
+
+
+def match_label(result: ReversalResult) -> str:
+    verdict = result.match_verdict
+    if verdict is None:
+        return "-"
+    if verdict.violations:
+        return "rejected"
+    if verdict.error:
+        return "error"
+    return "exact" if verdict.exact else f"{verdict.score:.1%}"
 
 
 def _result_to_dict(result: ReversalResult) -> dict[str, Any]:
@@ -101,4 +117,7 @@ def _result_to_dict(result: ReversalResult) -> dict[str, Any]:
         d["parity_status"] = result.parity_status.value
     if result.parity_findings:
         d["parity_findings"] = [{"level": f.level, "reason": f.reason} for f in result.parity_findings]
+    if result.match_verdict:
+        d["match"] = asdict(result.match_verdict)
+        d["match_tier"] = result.match_tier
     return d

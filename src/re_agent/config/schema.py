@@ -149,6 +149,48 @@ class ValidationConfig:
     parallel_safe: bool = False
 
 
+DEFAULT_FORBIDDEN_PATTERNS = [
+    r"\b__asm\b",
+    r"\b_asm\b",
+    r"\b__asm__\b",
+    r"\basm\s*(?:volatile|__volatile__|goto)?\s*\(",
+    r"\b_?_emit\b",
+    r"\b__pragma\s*\(",
+    r"\b_Pragma\s*\(",
+    r"#\s*pragma\b",
+    r"__attribute__\s*\(\(\s*(?:naked|optimize|section)\b",
+    r"__declspec\s*\(\s*naked\s*\)",
+]
+
+
+@dataclass
+class MatchingConfig:
+    """Byte-level matching of compiled candidates against the original binary.
+
+    The oracle is a project-owned command that compiles the overlaid candidate
+    with the original toolchain and prints one JSON comparison object.
+    """
+
+    enabled: bool = False
+    oracle_command: list[str] = field(default_factory=list)
+    original_binary: str | None = None
+    toolchain_files: list[str] = field(default_factory=list)
+    require_exact: bool = True
+    max_rounds: int = 30
+    plateau_rounds: int = 6
+    candidates_per_round: int = 1
+    diff_max_lines: int = 120
+    forbidden_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_FORBIDDEN_PATTERNS))
+    prompt_hints: list[str] = field(default_factory=list)
+    permuter_command: list[str] = field(default_factory=list)
+    permuter_threshold: float = 0.9
+    permuter_timeout_s: int = 600
+    unit_regression: bool = True
+    canary_address: str | None = None
+    canary_function: str | None = None
+    timeout_s: int = 300
+
+
 @dataclass
 class OutputConfig:
     """Output and reporting settings."""
@@ -171,6 +213,7 @@ class ReAgentConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     agents: AgentModelsConfig = field(default_factory=AgentModelsConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    matching: MatchingConfig = field(default_factory=MatchingConfig)
 
     @classmethod
     def create_default(cls) -> ReAgentConfig:
@@ -183,5 +226,6 @@ class ReAgentConfig:
             parity=ParityConfig(),
             orchestrator=OrchestratorConfig(),
             validation=ValidationConfig(),
+            matching=MatchingConfig(),
             output=OutputConfig(),
         )

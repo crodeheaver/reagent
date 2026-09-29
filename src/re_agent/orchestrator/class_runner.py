@@ -87,10 +87,14 @@ def _reverse_class(
             session=session,
             indexer=indexer,
         )
-        results.append(result)
         if result.success and config.validation.copy_project and config.orchestrator.cumulative_validation:
-            _promote(result, config)
+            try:
+                _promote(result, config, session)
+            except ValueError as exc:
+                result.success, result.error = False, str(exc)
+                session.amend_result(result)
             indexer = SourceIndexer(Path(config.project_profile.source_root), config.project_profile)
+        results.append(result)
 
         status = "PASS" if result.success else "FAIL"
         print(
@@ -101,7 +105,13 @@ def _reverse_class(
     return results
 
 
-def _promote(result: ReversalResult, config: ReAgentConfig) -> None:
+def _promote(result: ReversalResult, config: ReAgentConfig, session: Session | None = None) -> None:
+    """Write an accepted candidate into the scratch tree.
+
+    With a session and matching, a promotion that changes the bytes of functions
+    already recorded as exact in the same file (for example through inlining) is
+    reverted and rejected. Restoring earlier results passes no session.
+    """
     source_root = Path(config.project_profile.source_root)
     indexer = SourceIndexer(source_root, config.project_profile)
     matches = indexer.find_all(result.target.class_name, result.target.function_name)
@@ -110,7 +120,41 @@ def _promote(result: ReversalResult, config: ReAgentConfig) -> None:
     candidate = create_candidate_overlay(
         result.target, result.code, matches[0], source_root, Path(config.output.report_dir)
     )
-    Path(matches[0].path).write_text(candidate.read_text(encoding="utf-8"), encoding="utf-8")
+    path = Path(matches[0].path)
+    previous = path.read_bytes()
+    path.write_text(candidate.read_text(encoding="utf-8"), encoding="utf-8")
+    if session is None or not (config.matching.enabled and config.matching.unit_regression):
+        return
+    lost = _lost_matches(result, config, session, path)
+    if lost:
+        path.write_bytes(previous)
+        raise ValueError("Promotion reverted; it changed previously exact functions in the same file: "
+                         + "; ".join(lost))
+
+
+def _lost_matches(result: ReversalResult, config: ReAgentConfig, session: Session, path: Path) -> list[str]:
+    from re_agent.core.models import FunctionTarget
+    from re_agent.orchestrator.single import _resolve_source, evaluate_source_match
+    from re_agent.utils.address import normalize_address
+    from re_agent.verification.matching import qualified_name
+
+    indexer = SourceIndexer(Path(config.project_profile.source_root), config.project_profile)
+    promoted = normalize_address(result.target.address)
+    lost = []
+    for entry in session.get_all_functions():
+        if entry.get("match_tier") != "exact" or normalize_address(entry["address"]) == promoted:
+            continue
+        target = FunctionTarget(entry["address"], entry.get("class_name", ""), entry.get("function_name", ""))
+        try:
+            source = _resolve_source(target, indexer)
+        except ValueError:
+            continue  # Ambiguous definitions could not have been promoted either.
+        if source is None or Path(source.path).resolve() != path.resolve():
+            continue
+        verdict = evaluate_source_match(target, config, indexer)
+        if not verdict.accepted:
+            lost.append(f"{qualified_name(target)} ({target.address}): {verdict.summary}")
+    return lost
 
 
 def _reverse_class_run(
@@ -146,6 +190,10 @@ def _reverse_class_run(
             entries = backend.unimplemented(class_name)
         reverse_rank = effective.orchestrator.selection_strategy == "high-impact"
         entries.sort(key=lambda f: (-f.caller_count if reverse_rank else f.caller_count, f.name, f.address))
+        if effective.orchestrator.selection_strategy == "smallest-first":
+            from re_agent.core.function_picker import size_rank
+
+            entries.sort(key=lambda f: size_rank(backend, f.address))  # Stable: ties keep the order above.
         targets = [FunctionTarget(f.address, f.class_name or class_name, f.name, f.caller_count) for f in entries]
 
         def promote(result: ReversalResult, view: REBackend) -> ReversalResult:
@@ -153,7 +201,7 @@ def _reverse_class_run(
             result = validate_result(result, effective, view)
             if result.success:
                 try:
-                    _promote(result, effective)
+                    _promote(result, effective, session)
                 except ValueError as exc:  # A journaled proposal must not fail every recovery.
                     result.success, result.error = False, str(exc)
             return result

@@ -86,6 +86,29 @@ class ValidationVerdict:
 
 
 @dataclass
+class MatchVerdict:
+    """Comparison of a compiled candidate with the original function bytes.
+
+    ``exact`` is the oracle's claim that instructions and relocation targets are
+    identical. ``error`` means no comparison happened (for example, the candidate
+    did not compile); ``violations`` are forbidden constructs that void a match.
+    """
+
+    exact: bool
+    score: float
+    summary: str = ""
+    diff: list[str] = field(default_factory=list)
+    target_size: int | None = None
+    candidate_size: int | None = None
+    error: str | None = None
+    violations: list[str] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> bool:
+        return self.exact and self.error is None and not self.violations
+
+
+@dataclass
 class ReversalResult:
     """Complete result of reversing one function."""
 
@@ -100,6 +123,14 @@ class ReversalResult:
     validation_verdict: ValidationVerdict | None = None
     run_id: str = ""
     error: str | None = None
+    match_verdict: MatchVerdict | None = None
+
+    @property
+    def match_tier(self) -> str | None:
+        """``exact`` for accepted byte matches, ``functional`` for other accepted results."""
+        if not self.success:
+            return None
+        return "exact" if self.match_verdict is not None and self.match_verdict.accepted else "functional"
 
 
 # ---------------------------------------------------------------------------

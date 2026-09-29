@@ -10,6 +10,9 @@ CLI -> Config -> Orchestrator -> Evidence Loop -> LLM Providers
                       |
                       v
        Candidate Overlay -> Build/Test/Differential -> Parity Gate -> Repair feedback
+                      |
+                      v
+       Match Oracle (optional) -> Score-guided refinement -> Exact acceptance
 ```
 
 ## Layers
@@ -23,6 +26,8 @@ CLI -> Config -> Orchestrator -> Evidence Loop -> LLM Providers
   normalized P-code, and CFG capability flags
 - **Parity**: 11-signal verification engine with scoring
 - **Validation**: safe candidate overlay plus configurable build/test/runtime commands
+- **Matching**: project-owned oracle comparing compiled candidates with original bytes,
+  score-guided refinement, same-file regression checks, and whole-binary comparison
 - **Knowledge graph**: persistent calls, strings, and global relationships
 - **Reports**: JSON/markdown output, session tracking
 

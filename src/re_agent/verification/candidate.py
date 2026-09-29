@@ -194,12 +194,7 @@ def validate_candidate(
         except subprocess.TimeoutExpired:
             checks.append({"kind": kind, "verdict": "FAIL", "detail": "timed out"})
             return _failed(f"{kind} command timed out: {command}", candidate_file, findings, checks)
-        # First errors often explain cascades of missing types/declarations.
-        # Keep them alongside the final summary, prioritizing compiler stderr.
-        lines = (proc.stderr + "\n" + proc.stdout).strip().splitlines()
-        if len(lines) > 20:
-            lines = [*lines[:10], "[intermediate output omitted]", *lines[-10:]]
-        excerpt = "\n".join(line[:500] for line in lines)
+        excerpt = diagnostic_excerpt(proc.stderr + "\n" + proc.stdout)
         findings.append(f"{kind}: {command} -> exit {proc.returncode}\n{excerpt}".rstrip())
         checks.append({"kind": kind, "verdict": "PASS" if proc.returncode == 0 else "FAIL",
                        "detail": f"exit {proc.returncode}"})
@@ -262,6 +257,14 @@ def validate_candidate(
         checks=checks,
         overlay_file=str(candidate_file),
     )
+
+
+def diagnostic_excerpt(output: str) -> str:
+    """Keep first errors, which often explain cascades, alongside the final summary."""
+    lines = output.strip().splitlines()
+    if len(lines) > 20:
+        lines = [*lines[:10], "[intermediate output omitted]", *lines[-10:]]
+    return "\n".join(line[:500] for line in lines)
 
 
 def cleanup_candidate_overlay(candidate_file: Path) -> None:

@@ -70,6 +70,8 @@ def pick_next(
         candidates = [by_address[address] for address in ordered]
     elif strategy == "easiest-first":
         candidates.sort(key=lambda f: (f.caller_count, f.name, f.address))
+    elif strategy == "smallest-first":
+        candidates.sort(key=lambda f: size_rank(backend, f.address) + (f.caller_count, f.name, f.address))
     else:
         candidates.sort(key=lambda f: (-f.caller_count, f.name, f.address))
     best = candidates[0]
@@ -80,3 +82,14 @@ def pick_next(
         function_name=best.name,
         caller_count=best.caller_count,
     )
+
+
+def size_rank(backend: REBackend, address: str) -> tuple[int, int]:
+    """Order by instruction count; functions without disassembly sort last."""
+    if not getattr(backend.capabilities, "has_asm", False):
+        return (1, 0)
+    try:
+        asm = backend.get_asm(address)
+    except Exception:
+        return (1, 0)
+    return (0, asm.instruction_count) if asm is not None else (1, 0)

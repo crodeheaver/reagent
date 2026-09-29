@@ -98,6 +98,19 @@ validation:
   working_directory: "."
   keep_project_copy: false
 
+# Byte-identical (matching) decompilation. Requires the original compiler and
+# flags behind a project-owned oracle; see docs/matching.md.
+# matching:
+#   enabled: true
+#   oracle_command: ["python", "tools/match_oracle.py", "{candidate_file}", "{address}", "{function}"]
+#   original_binary: "orig/game.exe"
+#   toolchain_files: ["toolchain/bin/cl.exe"]
+#   require_exact: true
+#   max_rounds: 30
+#   plateau_rounds: 6
+#   candidates_per_round: 1
+#   canary_address: "0x401000"
+
 output:
   report_dir: "reports/re-agent"
   log_dir: "reports/re-agent/logs"

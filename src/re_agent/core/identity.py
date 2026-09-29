@@ -21,6 +21,9 @@ def project_fingerprint(config: ReAgentConfig) -> str:
     }
     # Execution-only settings must not change identities recorded by earlier releases.
     values["validation"].pop("parallel_safe", None)
+    if config.matching.enabled:
+        # Only enabled matching changes what acceptance means; disabled keeps prior identities.
+        values["matching"] = asdict(config.matching)
     digest.update(json.dumps(values, sort_keys=True).encode())
     root = Path(config.project_profile.source_root).resolve()
     digest.update(str(root).encode())
@@ -42,6 +45,11 @@ def project_fingerprint(config: ReAgentConfig) -> str:
     ):
         if value:
             digest.update(Path(value).read_bytes())
+    if config.matching.enabled:
+        # A different compiler or original binary invalidates every recorded match.
+        for value in [config.matching.original_binary, *config.matching.toolchain_files]:
+            if value:
+                digest.update(Path(value).read_bytes())
     return digest.hexdigest()
 
 

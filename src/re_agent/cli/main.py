@@ -31,6 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_p = sub.add_parser("doctor", help="Check configuration and exported evidence without LLM calls")
     doctor_p.add_argument("--address", help="Check evidence for one function")
+    doctor_p.add_argument("--skip-canary", action="store_true", help="Do not compile the matching canary")
+    toolchain_p = sub.add_parser("toolchain", help="Identify a binary's toolchain or search compiler flags")
+    toolchain_p.add_argument("--binary", help="Binary to identify (default: matching.original_binary)")
+    toolchain_p.add_argument("--flags", action="append",
+                             help="Flag variant passed to the oracle as RE_AGENT_MATCH_FLAGS (repeatable)")
+    toolchain_p.add_argument("--address", help="Function to score (default: matching.canary_address)")
+    toolchain_p.add_argument("--function", help="Qualified name when the address is not in the hook index")
+    match_binary_p = sub.add_parser("match-binary", help="Compare a rebuilt binary with the original")
+    match_binary_p.add_argument("--rebuilt", required=True)
+    match_binary_p.add_argument("--original", help="Original binary (default: matching.original_binary)")
+    match_binary_p.add_argument("--format", choices=["text", "json"], default="text")
     benchmark_p = sub.add_parser("benchmark", help="Run a differential harness manifest")
     benchmark_p.add_argument("--manifest", required=True)
     benchmark_p.add_argument("--output")
@@ -61,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     rev_p.add_argument("--max-parallel-requests", type=int, default=None, help="Concurrent model requests (1-32)")
     rev_p.add_argument("--max-parallel-validations", type=int, default=None, help="Concurrent isolated validations")
     rev_p.add_argument("--max-rounds", type=int, default=None, help="Max review rounds per function")
+    rev_p.add_argument("--max-match-rounds", type=int, default=None, help="Max byte-matching refinement rounds")
     rev_p.add_argument("--dry-run", action="store_true", help="Show plan without executing")
     rev_p.add_argument("--skip-parity", action="store_true", help="Skip parity check after PASS")
 
@@ -113,6 +125,14 @@ def _main(argv: list[str] | None = None) -> int:
         from re_agent.cli.cmd_doctor import cmd_doctor
 
         return cmd_doctor(args)
+    if args.command == "toolchain":
+        from re_agent.cli.cmd_matching import cmd_toolchain
+
+        return cmd_toolchain(args)
+    if args.command == "match-binary":
+        from re_agent.cli.cmd_matching import cmd_match_binary
+
+        return cmd_match_binary(args)
     if args.command == "benchmark":
         from re_agent.cli.cmd_benchmark import cmd_benchmark
 

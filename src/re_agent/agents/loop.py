@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import time
@@ -11,9 +12,10 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from re_agent.agents.checker import CheckerAgent
+from re_agent.agents.match_refinement import Evaluate, Permute, RefinementRound, rank, refine_match
 from re_agent.agents.reverser import ReverserAgent
 from re_agent.backend.protocol import REBackend
-from re_agent.config.schema import ProjectProfile
+from re_agent.config.schema import MatchingConfig, ProjectProfile
 from re_agent.core.models import (
     CheckerVerdict,
     FunctionTarget,
@@ -52,8 +54,16 @@ def run_fix_loop(
     candidate_gate: Callable[[ReversalResult], ReversalResult] | None = None,
     max_llm_calls: int = 80,
     candidate_preflight: Callable[[ReversalResult], ReversalResult] | None = None,
+    matching: MatchingConfig | None = None,
+    match_gate: Evaluate | None = None,
+    permute: Permute | None = None,
 ) -> ReversalResult:
     """Run the reverser->checker->fix loop up to max_rounds.
+
+    With ``matching``, an exact byte match ends the loop without model review, and
+    a functional or best-scoring candidate then enters score-guided refinement:
+    ``match_gate`` scores candidates with the oracle alone and ``candidate_gate``
+    confirms an exact match against every configured gate.
 
     Args:
         target: Function to reverse
@@ -88,6 +98,7 @@ def run_fix_loop(
         report_dir=report_dir,
         investigation_enabled=investigation_enabled,
         max_investigations=max_investigations,
+        matching=matching,
     )
     checker = CheckerAgent(checker_llm, backend)
 
@@ -101,6 +112,7 @@ def run_fix_loop(
     result = ReversalResult(target=target, code="", run_id=run_id)
     gate_issues: list[str] = []
     seen_failures: set[str] = set()
+    best_match: ReversalResult | None = None
 
     for round_num in range(1, max_rounds + 1):
         timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -155,6 +167,17 @@ def run_fix_loop(
             # gate failed, or it passed but parity policy rejected it. UNKNOWN (no or
             # untrusted commands) is a configuration outcome that review cannot change.
             verdict_kind = checked.validation_verdict.verdict if checked.validation_verdict else None
+            if matching is not None and checked.match_verdict is not None:
+                if best_match is None or rank(checked) > rank(best_match):
+                    best_match = checked
+                if checked.success and checked.match_verdict.accepted:
+                    # Identical bytes are stronger evidence than any review.
+                    _log_skipped_review(log_dir, round_num, timestamp, checked)
+                    if session is not None:
+                        session.record_checkpoint(checked)
+                    return checked
+                if checked.match_verdict.error or checked.match_verdict.violations:
+                    preflight_issues = _gate_issues(checked)
             if not checked.success and verdict_kind in (Verdict.FAIL, Verdict.PASS):
                 preflight_issues = _gate_issues(checked)
         if preflight_issues:
@@ -222,7 +245,9 @@ def run_fix_loop(
         if session is not None:
             session.record_checkpoint(result)
         if result.success:
-            return result
+            if matching is None or (result.match_verdict is not None and result.match_verdict.accepted):
+                return result
+            break  # Functionally accepted; refine towards identical bytes.
         failure_key = hashlib.sha256(
             json.dumps(
                 [
@@ -237,17 +262,101 @@ def run_fix_loop(
         ).hexdigest()
         if failure_key in seen_failures:
             result.error = "Stopped: identical candidate and diagnostics without progress"
-            return result
+            break
         seen_failures.add(failure_key)
 
-    return result
+    if matching is None:
+        return result
+    return _refine(result, best_match, matching, reverser, budget, match_gate, candidate_gate, permute,
+                   session, log_dir)
+
+
+def _refine(
+    result: ReversalResult,
+    best_match: ReversalResult | None,
+    matching: MatchingConfig,
+    reverser: ReverserAgent,
+    budget: CallBudget,
+    match_gate: Evaluate | None,
+    candidate_gate: Callable[[ReversalResult], ReversalResult] | None,
+    permute: Permute | None,
+    session: Session | None,
+    log_dir: Path | None,
+) -> ReversalResult:
+    """Search for an exact match, then decide between exact, functional and failed."""
+    functional = result if result.success else None
+    # Prefer the reviewed candidate; otherwise the closest compiled attempt.
+    start = functional or best_match
+    rounds = result.rounds_used
+    if start is None:
+        stop_reason = "no candidate reached the match oracle"
+    elif match_gate is None or matching.max_rounds == 0:
+        stop_reason = "matching refinement disabled"
+    else:
+        start.rounds_used = rounds
+
+        def on_round(record: RefinementRound, best: ReversalResult) -> None:
+            if log_dir:
+                entry = {"round": rounds + record.number, "phase": "match", "prompt": reverser.last_prompt,
+                         "response": reverser.last_response, "candidates": record.candidates, "note": record.note,
+                         "best_score": rank(best), "llm_metadata": _provider_metadata(reverser.llm)}
+                (log_dir / f"match{record.number}-{time.strftime('%Y%m%d-%H%M%S')}.json").write_text(
+                    json.dumps(entry, indent=2), encoding="utf-8")
+            if session is not None:
+                checkpoint = copy.copy(best)
+                checkpoint.rounds_used = rounds + record.number
+                session.record_checkpoint(checkpoint)
+
+        refinement = refine_match(start, matching, lambda best, attempts: reverser.propose_match(
+            best.target, best, attempts), match_gate, budget, permute=permute, on_round=on_round)
+        rounds += refinement.rounds
+        stop_reason = refinement.stop_reason
+        best = refinement.best
+        if best.match_verdict is not None and best.match_verdict.accepted:
+            confirmed = best
+            if candidate_gate is not None:
+                confirmed = candidate_gate(ReversalResult(best.target, best.code, success=True,
+                                                          rounds_used=rounds, run_id=best.run_id))
+            confirmed.rounds_used = rounds
+            if confirmed.success and confirmed.match_verdict is not None and confirmed.match_verdict.accepted:
+                return confirmed
+            confirmed.success = False
+            confirmed.error = "Exact match did not pass the configured validation gates"
+            return confirmed
+        if rank(best) > rank(start):
+            start = best
+    if functional is not None and not matching.require_exact:
+        functional.rounds_used = rounds
+        return functional
+    final = copy.copy(start) if start is not None else result
+    final.success = False
+    final.rounds_used = rounds
+    score = rank(final)
+    earlier = f"; {result.error}" if start is None and result.error else ""
+    final.error = (f"No exact match ({stop_reason}; best {score:.1%})" if score >= 0
+                   else f"No exact match ({stop_reason}{earlier})")
+    return final
 
 
 def _gate_issues(result: ReversalResult) -> list[str]:
     issues = [f"parity: {f.reason}" for f in result.parity_findings]
     if result.validation_verdict and result.validation_verdict.verdict != Verdict.PASS:
         issues.extend([result.validation_verdict.summary, *result.validation_verdict.findings])
+    match = result.match_verdict
+    if match is not None and match.error:
+        issues.append(match.error)
+    if match is not None:
+        issues.extend(match.violations)
     return issues
+
+
+def _log_skipped_review(log_dir: Path | None, round_num: int, timestamp: str, result: ReversalResult) -> None:
+    if not log_dir:
+        return
+    match = result.match_verdict
+    entry = {"round": round_num, "timestamp": timestamp, "phase": "check", "checker_skipped": True,
+             "reason": "exact byte match", "match_summary": match.summary if match else ""}
+    (log_dir / f"round{round_num}-{timestamp}-checker.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
 
 
 def _provider_metadata(provider: LLMProvider) -> dict[str, object]:

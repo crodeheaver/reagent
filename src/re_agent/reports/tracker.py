@@ -20,6 +20,8 @@ class ProgressTracker:
             f"Failed:           {summary['failed']}",
             f"Classes touched:  {summary['classes_touched']}",
         ]
+        if "exact_matches" in summary:
+            lines.append(f"Exact matches:    {summary['exact_matches']}")
         return "\n".join(lines)
 
     def print_class_summary(self, class_name: str) -> str:
@@ -45,6 +47,21 @@ class ProgressTracker:
                 "function": f.get("function_name", ""),
                 "status": "PASS" if f.get("success") else "FAIL",
                 "rounds": str(f.get("rounds_used", "")),
+                "match": match_cell(f.get("match")),
                 "timestamp": f.get("timestamp", ""),
             })
         return rows
+
+
+def match_cell(match: object) -> str:
+    """Render a stored match verdict for tables; ``-`` when matching did not run."""
+    if not isinstance(match, dict):
+        return "-"
+    if match.get("violations"):
+        return "rejected"
+    if match.get("error"):
+        return "error"
+    if match.get("exact"):
+        return "exact"
+    score = match.get("score")
+    return f"{score:.1%}" if isinstance(score, (int, float)) else "-"

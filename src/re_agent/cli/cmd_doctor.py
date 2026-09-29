@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from re_agent.backend.registry import create_backend
 from re_agent.config.loader import load_config
+from re_agent.config.schema import ReAgentConfig
 from re_agent.llm.registry import CLI_EXECUTABLES
 
 
@@ -37,6 +39,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         or validation.test_commands
         or validation.runtime_commands
         or validation.differential_cases_file
+        or (config.matching.enabled and config.matching.oracle_command)
     )
     add(
         "acceptance policy",
@@ -51,6 +54,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         (validation.require_runtime, validation.runtime_commands, "runtime"),
     ]:
         add(name + " gate", not validation.enabled or not required or bool(commands))
+    if config.matching.enabled:
+        _matching_checks(config, add, getattr(args, "skip_canary", False))
     try:
         backend = create_backend(config.backend)
         add("decompile capability", backend.capabilities.has_decompile)
@@ -61,3 +66,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         add("backend", False, str(exc))
     print(json.dumps({"checks": checks, "ready": all(c["passed"] for c in checks)}, indent=2))
     return 0 if all(c["passed"] for c in checks) else 1
+
+
+def _matching_checks(config: ReAgentConfig, add: Callable[[str, bool, str], None], skip_canary: bool) -> None:
+    matching = config.matching
+    executable = matching.oracle_command[0]
+    add("match oracle", shutil.which(executable) is not None or Path(executable).is_file(), executable)
+    if matching.permuter_command:
+        permuter = matching.permuter_command[0]
+        add("match permuter", shutil.which(permuter) is not None or Path(permuter).is_file(), permuter)
+    for label, value in [("original binary", matching.original_binary),
+                         *(("toolchain file", path) for path in matching.toolchain_files)]:
+        if value:
+            add(label, Path(value).is_file(), value)
+    add("match acceptance", config.validation.trust_configured_commands,
+        "Exact matches count only when validation.trust_configured_commands attests the oracle")
+    if not matching.canary_address:
+        add("match canary", True, "Not configured; set matching.canary_address to prove the toolchain first")
+    elif skip_canary:
+        add("match canary", True, "Skipped by --skip-canary")
+    else:
+        from re_agent.cli.cmd_matching import canary
+
+        try:
+            report = canary(config)
+        except (OSError, ValueError) as exc:
+            add("match canary", False, str(exc))
+        else:
+            add("match canary", bool(report["exact"]),
+                f"{report['function']} ({report['address']}): {report['error'] or report['summary']}")

@@ -8,7 +8,16 @@ from pathlib import Path
 from re_agent.agents.loop import run_fix_loop
 from re_agent.backend.protocol import REBackend
 from re_agent.config.schema import ReAgentConfig
-from re_agent.core.models import Finding, FunctionTarget, HookEntry, ReversalResult, ValidationVerdict, Verdict
+from re_agent.core.models import (
+    Finding,
+    FunctionTarget,
+    HookEntry,
+    MatchVerdict,
+    ReversalResult,
+    SourceMatch,
+    ValidationVerdict,
+    Verdict,
+)
 from re_agent.core.session import Session
 from re_agent.llm.protocol import LLMProvider
 from re_agent.parity.engine import fetch_ghidra_data, score_single
@@ -16,10 +25,18 @@ from re_agent.parity.rules import read_semantic_rules
 from re_agent.parity.source_indexer import SourceIndexer
 from re_agent.verification.candidate import (
     _sanitize_path_component,
+    _working_directory,
     cleanup_candidate_overlay,
     create_candidate_overlay,
     extract_candidate_body,
     validate_candidate,
+)
+from re_agent.verification.matching import (
+    forbidden_constructs,
+    oracle_values,
+    qualified_name,
+    run_oracle,
+    run_permuter,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,9 +64,12 @@ def reverse_single(
     log_dir = Path(config.output.log_dir) if config.output.log_dir else None
     checked: ReversalResult | None = None
 
+    # The loop decides whether a functional but non-matching candidate is final.
+    loop_policy = False if config.matching.enabled else None
+
     def preflight(result: ReversalResult) -> ReversalResult:
         nonlocal checked
-        checked = validate_result(result, config, backend, indexer)
+        checked = validate_result(result, config, backend, indexer, require_exact=loop_policy)
         return checked
 
     def gate(result: ReversalResult) -> ReversalResult:
@@ -57,9 +77,12 @@ def reverse_single(
             result.validation_verdict = checked.validation_verdict
             result.parity_status = checked.parity_status
             result.parity_findings = checked.parity_findings
+            result.match_verdict = checked.match_verdict
             result.success = result.success and checked.success
             return result
-        return validate_result(result, config, backend, indexer)
+        return validate_result(result, config, backend, indexer, require_exact=loop_policy)
+
+    matching = config.matching if config.matching.enabled else None
 
     try:
         result = run_fix_loop(
@@ -82,6 +105,11 @@ def reverse_single(
             candidate_gate=gate,
             candidate_preflight=preflight if config.validation.enabled else None,
             max_llm_calls=config.orchestrator.max_llm_calls_per_function,
+            matching=matching,
+            match_gate=(lambda result: validate_result(result, config, backend, indexer, match_only=True))
+            if matching else None,
+            permute=(lambda result: permute_candidate(result, config, indexer))
+            if matching and matching.permuter_command else None,
         )
     except (RuntimeError, OSError, ValueError) as exc:
         result = ReversalResult(target=target, code="", success=False, error=str(exc))
@@ -122,11 +150,141 @@ def validate_result(
     config: ReAgentConfig,
     backend: REBackend,
     indexer: SourceIndexer | None = None,
+    *,
+    match_only: bool = False,
+    require_exact: bool | None = None,
 ) -> ReversalResult:
+    """Run the configured gates, or with ``match_only`` just the match oracle.
+
+    ``require_exact=False`` lets the repair loop see functional acceptance of a
+    non-matching candidate; promotion keeps the configured policy.
+    """
     from re_agent.orchestrator.execution import validation_lane
 
     with validation_lane():
-        return _validate_result(result, config, backend, indexer)
+        if match_only:
+            return _evaluate_match_only(result, config, indexer)
+        return _validate_result(result, config, backend, indexer, require_exact)
+
+
+def _resolve_source(target: FunctionTarget, indexer: SourceIndexer) -> SourceMatch | None:
+    matches = indexer.find_all(target.class_name, target.function_name)
+    if len(matches) > 1:
+        locations = ", ".join(f"{match.path}:{match.line}" for match in matches)
+        raise ValueError(
+            f"Ambiguous overloaded source function; refusing to replace an arbitrary definition ({locations})"
+        )
+    original_source = indexer.find_by_address(target.address)
+    if original_source is None:
+        original_source = matches[0] if matches else indexer.find(target.class_name, target.function_name)
+    return original_source
+
+
+def _overlay(
+    result: ReversalResult, config: ReAgentConfig, indexer: SourceIndexer | None
+) -> tuple[Path, SourceMatch | None, SourceIndexer]:
+    if indexer is None:
+        indexer = SourceIndexer(Path(config.project_profile.source_root), config.project_profile)
+    original_source = _resolve_source(result.target, indexer)
+    candidate_file = create_candidate_overlay(
+        result.target,
+        result.code,
+        original_source,
+        Path(config.project_profile.source_root),
+        Path(config.output.report_dir),
+        project_root=Path(config.validation.project_root),
+        copy_project=config.validation.copy_project,
+        state_file=config.output.session_file,
+    )
+    return candidate_file, original_source, indexer
+
+
+def _discard_overlay(candidate_file: Path | None, config: ReAgentConfig) -> bool:
+    if candidate_file is None or not config.validation.copy_project or config.validation.keep_project_copy:
+        return False
+    cleanup_candidate_overlay(candidate_file)
+    return True
+
+
+def _match(
+    config: ReAgentConfig,
+    result: ReversalResult,
+    candidate_file: Path,
+    source: SourceMatch | None,
+    extra_env: dict[str, str] | None = None,
+) -> MatchVerdict:
+    violations = forbidden_constructs(result.code, config.matching.forbidden_patterns)
+    if violations:
+        return MatchVerdict(False, 0.0, "Forbidden constructs; candidate not compared", violations=violations)
+    values = oracle_values(config.matching, result.target, candidate_file, source.path if source else None)
+    return run_oracle(config.matching, values, _working_directory(config.validation, candidate_file), extra_env)
+
+
+def _evaluate_match_only(
+    result: ReversalResult,
+    config: ReAgentConfig,
+    indexer: SourceIndexer | None,
+    extra_env: dict[str, str] | None = None,
+) -> ReversalResult:
+    """Score one candidate with the oracle alone; other gates confirm exact matches later."""
+    candidate_file: Path | None = None
+    try:
+        candidate_file, source, _ = _overlay(result, config, indexer)
+        verdict = _match(config, result, candidate_file, source, extra_env)
+    except (OSError, ValueError) as exc:
+        verdict = MatchVerdict(False, 0.0, "Candidate overlay failed", error=str(exc))
+    finally:
+        _discard_overlay(candidate_file, config)
+    return ReversalResult(
+        target=result.target,
+        code=result.code,
+        rounds_used=result.rounds_used,
+        success=verdict.accepted and config.validation.trust_configured_commands,
+        run_id=result.run_id,
+        match_verdict=verdict,
+    )
+
+
+def evaluate_source_match(
+    target: FunctionTarget,
+    config: ReAgentConfig,
+    indexer: SourceIndexer | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> MatchVerdict:
+    """Score the definition already in the source tree, through the same overlay and oracle."""
+    from re_agent.orchestrator.execution import validation_lane
+
+    if indexer is None:
+        indexer = SourceIndexer(Path(config.project_profile.source_root), config.project_profile)
+    try:
+        source = _resolve_source(target, indexer)
+    except ValueError as exc:
+        return MatchVerdict(False, 0.0, "Source definition is ambiguous", error=str(exc))
+    if source is None:
+        return MatchVerdict(False, 0.0, "Source definition not found",
+                            error=f"No source definition for {qualified_name(target)}")
+    with validation_lane():
+        result = _evaluate_match_only(ReversalResult(target, source.body), config, indexer, extra_env)
+    assert result.match_verdict is not None
+    return result.match_verdict
+
+
+def permute_candidate(
+    result: ReversalResult, config: ReAgentConfig, indexer: SourceIndexer | None = None
+) -> tuple[str | None, str]:
+    """Hand the best candidate, overlaid in its project, to the configured permuter."""
+    from re_agent.orchestrator.execution import validation_lane
+
+    candidate_file: Path | None = None
+    with validation_lane():
+        try:
+            candidate_file, source, _ = _overlay(result, config, indexer)
+            values = oracle_values(config.matching, result.target, candidate_file, source.path if source else None)
+            return run_permuter(config.matching, values, _working_directory(config.validation, candidate_file))
+        except (OSError, ValueError) as exc:
+            return None, f"permuter skipped: {exc}"
+        finally:
+            _discard_overlay(candidate_file, config)
 
 
 def _validate_result(
@@ -134,35 +292,16 @@ def _validate_result(
     config: ReAgentConfig,
     backend: REBackend,
     indexer: SourceIndexer | None = None,
+    require_exact: bool | None = None,
 ) -> ReversalResult:
     """Validate one round and return its candidate-level diagnostics."""
+    if require_exact is None:
+        require_exact = config.matching.require_exact
     target = result.target
     if result.code:
         candidate_file: Path | None = None
         try:
-            if indexer is None:
-                source_root = Path(config.project_profile.source_root)
-                indexer = SourceIndexer(source_root, config.project_profile)
-            source_root = Path(config.project_profile.source_root)
-            matches = indexer.find_all(target.class_name, target.function_name)
-            if len(matches) > 1:
-                locations = ", ".join(f"{match.path}:{match.line}" for match in matches)
-                raise ValueError(
-                    f"Ambiguous overloaded source function; refusing to replace an arbitrary definition ({locations})"
-                )
-            original_source = indexer.find_by_address(target.address)
-            if original_source is None:
-                original_source = matches[0] if matches else indexer.find(target.class_name, target.function_name)
-            candidate_file = create_candidate_overlay(
-                target,
-                result.code,
-                original_source,
-                source_root,
-                Path(config.output.report_dir),
-                project_root=Path(config.validation.project_root),
-                copy_project=config.validation.copy_project,
-                state_file=config.output.session_file,
-            )
+            candidate_file, original_source, indexer = _overlay(result, config, indexer)
             candidate_body = extract_candidate_body(result.code)
             source = indexer.analyze_body(
                 str(candidate_file),
@@ -174,6 +313,12 @@ def _validate_result(
                 config.validation,
                 candidate_file,
                 original_source.path if original_source else None,
+            )
+            # A candidate that failed its build or tests has nothing meaningful to compare.
+            match_verdict = (
+                _match(config, result, candidate_file, original_source)
+                if config.matching.enabled and validation_verdict.verdict != Verdict.FAIL
+                else None
             )
 
             # Fetch Ghidra data from the backend for signal checks
@@ -203,11 +348,23 @@ def _validate_result(
                 validation_accepted = validation_verdict.verdict == Verdict.PASS
             else:
                 validation_accepted = validation_verdict.verdict != Verdict.FAIL
+            compiled = (match_verdict is not None and match_verdict.error is None and not match_verdict.violations
+                        and config.validation.trust_configured_commands)
+            if compiled and validation_verdict.verdict == Verdict.UNKNOWN:
+                validation_accepted = True  # The trusted oracle compiled the candidate; no other gate exists.
             accepted = result.success and validation_accepted
             if status is not None:
                 if config.validation.parity_fail_on_red and status.value == "red":
                     accepted = False
                 if config.validation.parity_fail_on_yellow and status.value == "yellow":
+                    accepted = False
+            if config.matching.enabled:
+                if (match_verdict is not None and match_verdict.accepted
+                        and config.validation.trust_configured_commands):
+                    # Identical bytes subsume model review and source heuristics; the
+                    # configured gates still ran. With only the oracle, UNKNOWN is expected.
+                    accepted = validation_verdict.verdict != Verdict.FAIL
+                elif require_exact:
                     accepted = False
             result = ReversalResult(
                 target=result.target,
@@ -220,6 +377,7 @@ def _validate_result(
                 rounds_used=result.rounds_used,
                 success=accepted,
                 run_id=result.run_id,
+                match_verdict=match_verdict,
             )
         except (FileNotFoundError, OSError, ValueError) as exc:
             logger.warning("Candidate validation failed for %s: %s", target.address, exc)
@@ -230,16 +388,10 @@ def _validate_result(
             )
             result.success = False
         finally:
-            if (
-                candidate_file is not None
-                and config.validation.copy_project
-                and not config.validation.keep_project_copy
-            ):
-                cleanup_candidate_overlay(candidate_file)
-                if result.validation_verdict is not None:
-                    result.validation_verdict.overlay_file = None
-                    result.validation_verdict.findings.append(
-                        "Temporary isolated project copy removed after validation"
-                    )
+            if _discard_overlay(candidate_file, config) and result.validation_verdict is not None:
+                result.validation_verdict.overlay_file = None
+                result.validation_verdict.findings.append(
+                    "Temporary isolated project copy removed after validation"
+                )
 
     return result

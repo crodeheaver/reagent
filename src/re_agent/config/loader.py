@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -12,6 +13,7 @@ from re_agent.config.schema import (
     AgentModelsConfig,
     BackendConfig,
     LLMConfig,
+    MatchingConfig,
     OrchestratorConfig,
     OutputConfig,
     ParityConfig,
@@ -177,6 +179,10 @@ def _build_validation_config(data: dict[str, Any]) -> ValidationConfig:
     return _build_with_coercion(ValidationConfig, data)
 
 
+def _build_matching_config(data: dict[str, Any]) -> MatchingConfig:
+    return _build_with_coercion(MatchingConfig, data)
+
+
 def _build_config(raw: dict[str, Any]) -> ReAgentConfig:
     """Build a ReAgentConfig from a raw dict."""
     return ReAgentConfig(
@@ -187,6 +193,7 @@ def _build_config(raw: dict[str, Any]) -> ReAgentConfig:
         parity=_build_parity_config(raw.get("parity", {})),
         orchestrator=_build_orchestrator_config(raw.get("orchestrator", {})),
         validation=_build_validation_config(raw.get("validation", {})),
+        matching=_build_matching_config(raw.get("matching", {})),
         output=_build_output_config(raw.get("output", {})),
     )
 
@@ -265,7 +272,9 @@ def validate_config(config: ReAgentConfig) -> None:
             raise ValueError(f"orchestrator.{name} must be a positive integer")
     if type(config.orchestrator.max_investigations) is not int or config.orchestrator.max_investigations < 0:
         raise ValueError("max_investigations must be a nonnegative integer")
-    if config.orchestrator.selection_strategy not in {"dependency-order", "easiest-first", "high-impact"}:
+    if config.orchestrator.selection_strategy not in {
+        "dependency-order", "easiest-first", "high-impact", "smallest-first",
+    }:
         raise ValueError("Unknown selection_strategy")
     for name in (
         "build_commands",
@@ -286,3 +295,33 @@ def validate_config(config: ReAgentConfig) -> None:
             raise ValueError(f"validation.{name} must be a list of strings")
     if config.validation.command_timeout_s <= 0:
         raise ValueError("validation.command_timeout_s must be positive")
+    validate_matching(config)
+
+
+def validate_matching(config: ReAgentConfig) -> None:
+    matching = config.matching
+    for name in ("oracle_command", "permuter_command", "toolchain_files", "prompt_hints", "forbidden_patterns"):
+        value = getattr(matching, name)
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"matching.{name} must be a list of nonempty strings")
+    for pattern in matching.forbidden_patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"matching.forbidden_patterns contains an invalid regex {pattern!r}: {exc}") from None
+    for name, minimum in (("max_rounds", 0), ("plateau_rounds", 1), ("diff_max_lines", 10),
+                          ("permuter_timeout_s", 1), ("timeout_s", 1)):
+        value = getattr(matching, name)
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"matching.{name} must be an integer of at least {minimum}")
+    if type(matching.candidates_per_round) is not int or not 1 <= matching.candidates_per_round <= 8:
+        raise ValueError("matching.candidates_per_round must be an integer from 1 to 8")
+    if not isinstance(matching.permuter_threshold, (int, float)) or not 0 <= matching.permuter_threshold <= 1:
+        raise ValueError("matching.permuter_threshold must be between 0 and 1")
+    if matching.enabled:
+        if not matching.oracle_command:
+            raise ValueError("matching.enabled requires matching.oracle_command")
+        if not config.validation.enabled:
+            raise ValueError("matching.enabled requires validation.enabled; oracles compile candidate overlays")
+    if matching.canary_function and not matching.canary_address:
+        raise ValueError("matching.canary_function requires matching.canary_address")

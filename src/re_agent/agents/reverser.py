@@ -8,9 +8,9 @@ from pathlib import Path
 
 from re_agent.agents.source_context import SourceContextBuilder
 from re_agent.backend.protocol import REBackend
-from re_agent.config.schema import ProjectProfile
+from re_agent.config.schema import MatchingConfig, ProjectProfile
 from re_agent.core.knowledge_graph import KnowledgeGraph
-from re_agent.core.models import FunctionTarget
+from re_agent.core.models import FunctionTarget, ReversalResult
 from re_agent.core.session import Session
 from re_agent.llm.protocol import LLMProvider, Message
 from re_agent.parity.source_indexer import SourceIndexer
@@ -18,7 +18,7 @@ from re_agent.utils.evidence import bounded_evidence
 from re_agent.utils.templates import render_template
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+)?\s*\n(.*?)```", re.S)
+CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+|cxx|cc|c)?\s*\n(.*?)```", re.S)
 REVERSED_TAG_RE = re.compile(r"REVERSED_FUNCTION:\s*(.+)")
 
 
@@ -36,8 +36,10 @@ class ReverserAgent:
         report_dir: Path | None = None,
         investigation_enabled: bool = True,
         max_investigations: int = 8,
+        matching: MatchingConfig | None = None,
     ) -> None:
         self.llm = llm
+        self._matching = matching
         self._session = session
         self.backend = backend
         self._project_profile = project_profile
@@ -132,10 +134,67 @@ class ReverserAgent:
         return code, tag
 
     def _project_rules(self) -> str:
-        if self._project_profile is None:
-            return "- No additional project-specific rules"
-        rules = self._project_profile.prompt_rules
+        rules = list(self._project_profile.prompt_rules) if self._project_profile is not None else []
+        if self._matching is not None:
+            rules.append("The goal is byte-identical compilation with the project's original compiler and flags: "
+                         "follow the disassembly's types, instruction order and branch shape, not only its behavior")
+            rules.extend(self._matching.prompt_hints)
         return "\n".join(f"- {rule}" for rule in rules) or "- No additional project-specific rules"
+
+    def propose_match(self, target: FunctionTarget, best: ReversalResult, attempts: list[str]) -> list[str]:
+        """Ask for candidates closer to the original bytes, in a fresh bounded prompt.
+
+        Each matching round is stateless: the best candidate, its comparison and the
+        attempt log carry what earlier rounds learned without an ever-growing history.
+        """
+        assert self._matching is not None
+        verdict = best.match_verdict
+        if verdict is None:
+            comparison, score = "Not compared yet.", "unscored"
+        elif verdict.error or verdict.violations:
+            comparison = "\n".join([verdict.error or "", *verdict.violations]).strip()
+            score = "did not compile" if verdict.error else "rejected"
+        else:
+            sizes = (f"\nSize: target {verdict.target_size} bytes, candidate {verdict.candidate_size} bytes"
+                     if verdict.target_size is not None and verdict.candidate_size is not None else "")
+            comparison = verdict.summary + sizes + ("\n" + "\n".join(verdict.diff) if verdict.diff else "")
+            score = f"{verdict.score:.1%} match"
+        asm = "Unavailable"
+        if getattr(self.backend.capabilities, "has_asm", False):
+            try:
+                listing = self.backend.get_asm(target.address)
+            except Exception:
+                listing = None
+            if listing is not None:
+                asm = bounded_evidence(listing.instructions, 20000)
+        count = self._matching.candidates_per_round
+        prompt = render_template(
+            PROMPTS_DIR / "match_task.md",
+            class_name=target.class_name,
+            function_name=target.function_name,
+            address=target.address,
+            score=score,
+            code=best.code,
+            comparison=comparison,
+            asm=asm,
+            attempts="\n".join(f"- {line}" for line in attempts[-12:]) or "None yet",
+            hints=self._project_rules(),
+            forbidden="\n".join(f"- `{pattern}`" for pattern in self._matching.forbidden_patterns) or "None",
+            count=str(count),
+        )
+        self.last_prompt = prompt
+        response = self.llm.send([
+            Message(role="system", content=render_template(PROMPTS_DIR / "match_system.md")),
+            Message(role="user", content=prompt),
+        ])
+        self.last_response = response
+        payload = self._extract_json(response)
+        if payload is not None and ("actions" in payload or "blocked" in payload):
+            raise ValueError("Matching rounds cannot request evidence; the prompt already contains it")
+        blocks = [block.strip() for block in CODE_BLOCK_RE.findall(response) if block.strip()]
+        if not blocks:
+            blocks = [self._extract_code(response)] if response.strip() else []
+        return blocks[:count]
 
     def _build_investigation_context(self, target: FunctionTarget) -> str:
         """Collect bounded structured evidence exposed by the RE backend."""

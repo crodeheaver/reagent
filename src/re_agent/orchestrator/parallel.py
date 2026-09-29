@@ -24,6 +24,7 @@ from re_agent.core.models import (
     CheckerVerdict,
     Finding,
     FunctionTarget,
+    MatchVerdict,
     ObjectiveVerdict,
     ParityStatus,
     ReversalResult,
@@ -60,6 +61,8 @@ def decode_result(data: dict[str, Any]) -> ReversalResult:
     if data.get("parity_status"):
         result.parity_status = ParityStatus(data["parity_status"])
     result.parity_findings = [Finding(**f) for f in data.get("parity_findings", [])]
+    if data.get("match"):
+        result.match_verdict = MatchVerdict(**data["match"])
     return result
 
 
