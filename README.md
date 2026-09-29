@@ -57,7 +57,9 @@ This is conservative verification, not a proof of semantic equivalence.
 
 For matching decompilation, enable `matching` with the original compiler behind a
 match oracle. An exact byte match then replaces model review, and candidates that
-are close are refined against the instruction diff until they match. See
+are close are refined against the instruction diff until they match. For 32-bit
+MSVC/Windows programs, `re-agent init --profile msvc-matching` sets up the bundled
+oracle and reccmp-style source annotations. See
 [byte-identical decompilation](docs/matching.md).
 
 ## New in 0.4.0

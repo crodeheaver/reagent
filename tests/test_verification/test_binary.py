@@ -15,13 +15,13 @@ RICH_KEY = 0x12345678
 
 
 def build_pe(timestamp: int = 1, checksum: int = 2, guid: bytes = b"\x11" * 16, text: bytes = b"\x55\x8b\xec\xc3",
-             rich_build: int = 3077) -> bytes:
+             rich_build: int = 3077, compiler: int = 0x60) -> bytes:
     """A minimal PE32 image: headers, .text and .rdata holding a CodeView debug record."""
     data = bytearray(0x800)
     data[0:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x100)
     struct.pack_into("<IIII", data, 0x80, 0x536E6144 ^ RICH_KEY, RICH_KEY, RICH_KEY, RICH_KEY)
-    for index, (comp_id, count) in enumerate([(0xCE << 16 | rich_build, 5), (0x5D << 16 | 4035, 1)]):
+    for index, (comp_id, count) in enumerate([(compiler << 16 | rich_build, 5), (0x5A << 16 | 3077, 1)]):
         struct.pack_into("<II", data, 0x90 + 8 * index, comp_id ^ RICH_KEY, count ^ RICH_KEY)
     data[0xA0:0xA4] = b"Rich"
     struct.pack_into("<I", data, 0xA4, RICH_KEY)
@@ -79,8 +79,14 @@ def test_identify_decodes_linker_and_rich_records(tmp_path):
     assert info["linker_version"] == "7.10"
     assert info["linker_hint"] == "Visual Studio .NET 2003"
     assert info["machine"] == "0x014c" and not info["pe32_plus"]
-    assert info["rich_header"] == [{"product_id": 0xCE, "build": 3077, "count": 5},
-                                   {"product_id": 0x5D, "build": 4035, "count": 1}]
+    assert info["rich_header"] == [
+        {"product_id": 0x60, "build": 3077, "count": 5, "tool": "C++ 13.10 (VS .NET 2003)"},
+        {"product_id": 0x5A, "build": 3077, "count": 1, "tool": "Linker 7.10"}]
+    assert info["compiler_hint"] == "C++ 13.10 (VS .NET 2003) build 3077"
+    assert info["ltcg"] is False
+    ltcg = identify(write(tmp_path, "b.exe", build_pe(compiler=0x64)))
+    assert ltcg["ltcg"] is True and ltcg["rich_header"][0]["tool"] == "C++ 13.10 LTCG"
+    assert ltcg["compiler_hint"] == "C++ 13.10 LTCG build 3077"
 
 
 def test_malformed_and_unknown_files_compare_raw(tmp_path):

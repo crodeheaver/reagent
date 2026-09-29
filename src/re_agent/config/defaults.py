@@ -176,6 +176,30 @@ EXAMPLE_PROFILE_TEMPLATES: dict[str, dict[str, Any]] = {
         "source_extensions": [".cpp", ".h", ".hpp"],
         "hooks_csv": "docs/hooks.csv",
     },
+    "msvc-matching": {
+        "name": "msvc-matching",
+        "language_standard": "C++98 as accepted by the project's MSVC version",
+        "prompt_rules": [
+            "Target the project's legacy MSVC compiler: no C++11 or later features (auto, nullptr, "
+            "range-based for, lambdas, override, constexpr, enum class, static_assert, <cstdint>)",
+            "Member functions are __thiscall (this in ECX); keep __cdecl, __stdcall or __fastcall "
+            "where the original uses them",
+            "Locals whose types have destructors make MSVC emit exception-handling frames; "
+            "construct them exactly where the original does",
+            "Keep local declaration order and exact types; they decide stack layout and register allocation",
+            "Call inline helpers from the project's headers instead of expanding them by hand",
+            "Keep float versus double and the order of floating-point operations; x87 code depends on both",
+        ],
+        "hook_patterns": [],
+        "annotation_modules": ["GAME"],
+        "stub_patterns": [r"TODO|NOT_IMPLEMENTED"],
+        "stub_markers": ["NOT_IMPLEMENTED"],
+        "stub_call_prefix": "__re_agent_no_stub_prefix__",
+        "class_macro": "",
+        "source_root": "src",
+        "source_extensions": [".cpp", ".c", ".h", ".hpp"],
+        "hooks_csv": None,
+    },
     "openrct2": {
         "name": "openrct2",
         "language_standard": "C++20",
@@ -194,5 +218,32 @@ EXAMPLE_PROFILE_TEMPLATES: dict[str, dict[str, Any]] = {
         "source_root": "src",
         "source_extensions": [".cpp", ".h", ".hpp"],
         "hooks_csv": None,
+    },
+}
+
+# Sections beyond project_profile that a profile template also writes.
+PROFILE_SECTIONS: dict[str, dict[str, Any]] = {
+    "msvc-matching": {
+        "validation": {
+            "enabled": True,
+            "copy_project": True,
+            "project_root": ".",
+            # Attest the oracle only after `re-agent doctor` reports an exact canary.
+            "trust_configured_commands": False,
+        },
+        "matching": {
+            "enabled": True,
+            "original_binary": "orig/game.exe",
+            "oracle_command": [
+                "{python}", "-m", "re_agent.oracles.msvc",
+                "--original", "{original_binary}", "--address", "{address}", "--function", "{function}",
+                "--source", "{candidate_file}", "--compile", "cl /nologo /c {source} /Fo{object}",
+                "--annotations", "{overlay_root}/src", "--module", "GAME",
+                "--", "/O2",
+            ],
+            "require_exact": True,
+            "canary_address": None,
+        },
+        "orchestrator": {"selection_strategy": "smallest-first"},
     },
 }

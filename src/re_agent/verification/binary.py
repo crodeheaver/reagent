@@ -17,6 +17,30 @@ from typing import Any
 
 _CHUNK = 4096
 _DEBUG_CODEVIEW, _DEBUG_REPRO = 2, 16
+# Rich header product ids (comp.id >> 16) of the tools older Windows programs were
+# built with, checked against two published comp.id lists. Unknown ids stay numeric.
+_RICH_TOOLS = {
+    0x04: "Linker 6.00", 0x06: "Cvtres 5.00", 0x0A: "C 12.00 (VC 6.0)", 0x0B: "C++ 12.00 (VC 6.0)",
+    0x0E: "MASM 6.13", 0x0F: "MASM 7.10", 0x12: "MASM 6.14",
+    0x1C: "C 13.00 (VS .NET 2002)", 0x1D: "C++ 13.00 (VS .NET 2002)", 0x3D: "Linker 7.00", 0x40: "MASM 7.00",
+    0x45: "Cvtres 7.00", 0x5A: "Linker 7.10", 0x5E: "Cvtres 7.10", 0x5F: "C 13.10 (VS .NET 2003)",
+    0x60: "C++ 13.10 (VS .NET 2003)", 0x6D: "C 14.00 (VS 2005)", 0x6E: "C++ 14.00 (VS 2005)", 0x78: "Linker 8.00",
+    0x7C: "Cvtres 8.00", 0x83: "C 15.00 (VS 2008)", 0x84: "C++ 15.00 (VS 2008)", 0x91: "Linker 9.00",
+    0x94: "Cvtres 9.00", 0x95: "MASM 9.00", 0x9D: "Linker 10.00", 0xAA: "C 16.00 (VS 2010)",
+    0xAB: "C++ 16.00 (VS 2010)",
+}
+# Objects compiled with /GL carry no machine code until link time.
+_LTCG_TOOLS = {
+    0x2B: "C 13.00 LTCG", 0x2C: "C++ 13.00 LTCG", 0x50: "C 13.10p LTCG", 0x51: "C++ 13.10p LTCG",
+    0x63: "C 13.10 LTCG", 0x64: "C++ 13.10 LTCG", 0x71: "C 14.00 LTCG", 0x72: "C++ 14.00 LTCG",
+    0x82: "MSIL 14.00 LTCG", 0x89: "C 15.00 LTCG", 0x8A: "C++ 15.00 LTCG", 0x8B: "MSIL 15.00 LTCG",
+    0xA3: "C 16.00 LTCG (Phoenix)", 0xA4: "C++ 16.00 LTCG (Phoenix)", 0xA5: "MSIL 16.00 LTCG (Phoenix)",
+    0xAE: "C 16.00 LTCG", 0xAF: "C++ 16.00 LTCG", 0xB0: "MSIL 16.00 LTCG", 0xC0: "C 16.10 LTCG",
+    0xC1: "C++ 16.10 LTCG", 0xC2: "MSIL 16.10 LTCG", 0xD2: "C 17.00 LTCG", 0xD3: "C++ 17.00 LTCG",
+    0xD4: "MSIL 17.00 LTCG", 0xE4: "C 18.00 LTCG", 0xE5: "C++ 18.00 LTCG", 0xE6: "MSIL 18.00 LTCG",
+    0xF6: "C 18.10 LTCG", 0xF7: "C++ 18.10 LTCG", 0xF8: "MSIL 18.10 LTCG", 0x108: "C 19.00 LTCG",
+    0x109: "C++ 19.00 LTCG", 0x10A: "MSIL 19.00 LTCG",
+}
 _LINKER_VERSIONS = {
     (6, 0): "Visual C++ 6.0",
     (7, 0): "Visual Studio .NET 2002",
@@ -173,16 +197,23 @@ def _pe_layout(data: bytes, e_lfanew: int) -> Layout:
         "pe32_plus": plus,
         "timestamp": timestamp,
         "linker_version": f"{major}.{minor:02d}",
-        "rich_header": _rich_header(data, e_lfanew),
+        "rich_header": (rich := _rich_header(data, e_lfanew)),
     }
     hint = _LINKER_VERSIONS.get((major, minor)) or ("Visual Studio 2015 or later (14.x toolset)"
                                                      if major == 14 else None)
     if hint:
         details["linker_hint"] = hint
+    if rich:
+        compilers = sorted((e for e in rich if e.get("tool", "").startswith(("C ", "C++ "))),
+                           key=lambda e: -int(e["count"]))
+        if compilers:
+            details["compiler_hint"] = f"{compilers[0]['tool']} build {compilers[0]['build']}"
+        # Link-time code generation compiles at link time: per-function oracles cannot reproduce it.
+        details["ltcg"] = any(e["product_id"] in _LTCG_TOOLS for e in rich)
     return Layout("pe", regions, masked, details)
 
 
-def _rich_header(data: bytes, e_lfanew: int) -> list[dict[str, int]] | None:
+def _rich_header(data: bytes, e_lfanew: int) -> list[dict[str, Any]] | None:
     """Decode MSVC tool records (product id, build number, object count) if present."""
     end = data.rfind(b"Rich", 0x40, e_lfanew)
     if end < 0 or end + 8 > len(data):
@@ -195,7 +226,11 @@ def _rich_header(data: bytes, e_lfanew: int) -> list[dict[str, int]] | None:
     entries = []
     for offset in range(start + 16, end, 8):
         comp_id, count = (value ^ key for value in struct.unpack_from("<II", data, offset))
-        entries.append({"product_id": comp_id >> 16, "build": comp_id & 0xFFFF, "count": count})
+        entry: dict[str, Any] = {"product_id": comp_id >> 16, "build": comp_id & 0xFFFF, "count": count}
+        tool = _RICH_TOOLS.get(comp_id >> 16) or _LTCG_TOOLS.get(comp_id >> 16)
+        if tool:
+            entry["tool"] = tool
+        entries.append(entry)
     return entries
 
 

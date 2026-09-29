@@ -86,6 +86,11 @@ project_profile:
   source_extensions: [".cpp", ".h", ".hpp"]
 ```
 
+For matching projects, `project_profile.annotation_modules` (default empty) reads
+reccmp-style `// FUNCTION: MODULE 0xADDRESS` markers for the listed modules, so
+addresses resolve to definitions without hook macros. See
+[MSVC projects](matching.md#msvc-projects).
+
 ## Parity Config
 
 ```yaml

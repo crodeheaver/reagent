@@ -299,6 +299,9 @@ def validate_config(config: ReAgentConfig) -> None:
 
 
 def validate_matching(config: ReAgentConfig) -> None:
+    modules = config.project_profile.annotation_modules
+    if not isinstance(modules, list) or not all(isinstance(m, str) and re.fullmatch(r"\w+", m) for m in modules):
+        raise ValueError("project_profile.annotation_modules must be a list of module names")
     matching = config.matching
     for name in ("oracle_command", "permuter_command", "toolchain_files", "prompt_hints", "forbidden_patterns"):
         value = getattr(matching, name)

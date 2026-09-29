@@ -13,6 +13,14 @@
 - Add a doctor canary that compiles a known-matching function before model calls, `smallest-first` selection, `--max-match-rounds`, and exact/functional tiers with byte-weighted progress in `status`.
 - Add a reference GCC/Clang ELF oracle using GNU binutils in `examples/matching_elf`.
 
+### MSVC and Windows projects
+
+- Add `python -m re_agent.oracles.msvc` (extra `auto-re-agent[msvc]`), a match oracle for 32-bit x86 COFF objects and PE images. It compares references by original address; anonymous data by content; branches, inline jump tables and byte tables by function offsets; and exception-handler thunks by shape. It reports candidate symbols missing from the symbol map.
+- Resolve symbols from MSVC `/MAP` files, JSON and text name lists, and source annotations, undecorating names with `undname`, `llvm-undname` or a built-in decoder. Support Wine compilers through `{source_win}`/`{object_win}` paths.
+- Read reccmp-style `// FUNCTION:`, `// STUB:`, `// GLOBAL:`, `// VTABLE:`, `// SYNTHETIC:`, `// TEMPLATE:` and `// LIBRARY:` annotations for the modules in `project_profile.annotation_modules`, with scope-qualified names. Match source addresses regardless of padding or case.
+- Add `re-agent init --profile msvc-matching` with legacy-MSVC prompt rules, annotations, the bundled oracle and `smallest-first` selection, and a `{python}` oracle placeholder.
+- Name VC 6.0–VS 2010 tools in Rich headers, report the dominant compiler, and flag link-time code generation.
+
 ### Fixes
 
 - Extract ```` ```c ```` fenced code blocks from model responses, not only C++ fences.

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
 
-from re_agent.config.defaults import DEFAULT_CONFIG_YAML, EXAMPLE_PROFILE_TEMPLATES
+from re_agent.config.defaults import DEFAULT_CONFIG_YAML, EXAMPLE_PROFILE_TEMPLATES, PROFILE_SECTIONS
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -28,6 +28,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             data["project_profile"] = {}
         for key, value in profile_overrides.items():
             data["project_profile"][key] = value
+        for section, values in PROFILE_SECTIONS.get(args.profile, {}).items():
+            data[section] = {**(data.get(section) or {}), **values}
         content = "# re-agent configuration\n"
         content += f"# Profile: {args.profile}\n\n"
         content += yaml.dump(data, default_flow_style=False, sort_keys=False)

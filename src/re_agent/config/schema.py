@@ -27,6 +27,9 @@ class ProjectProfile:
     )
     stub_call_prefix: str = "plugin::Call"
     class_macro: str = "RH_ScopedClass"
+    # reccmp-style `// FUNCTION: MODULE 0xADDRESS` markers for these modules map
+    # addresses to definitions; empty disables annotation scanning.
+    annotation_modules: list[str] = field(default_factory=list)
     source_root: str = "source/game_sa"
     compilation_database: str | None = None
     source_extensions: list[str] = field(

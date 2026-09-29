@@ -26,10 +26,10 @@ reverse ── repair loop ──┬─ exact match ─────────�
 - **A project laid out like the original.** The candidate is compiled inside its
   real translation unit. String pools, inlining and register allocation depend on
   the surrounding file.
-- **A match oracle**, described below. ReAgent defines the contract; adapters wrap
-  existing tools. Use reccmp for MSVC/PE projects, objdiff for COFF/ELF on several
-  architectures, or the [reference ELF oracle](../examples/matching_elf) for
-  GCC/Clang on x86-64.
+- **A match oracle**, described below. ReAgent defines the contract and ships an
+  [MSVC oracle](#msvc-projects) for 32-bit x86 Windows programs. The
+  [reference ELF oracle](../examples/matching_elf) covers GCC/Clang on x86-64;
+  other tools, such as objdiff, can be wrapped behind the same contract.
 
 Two build settings limit what can be compared function by function:
 
@@ -80,6 +80,7 @@ data:
 | `{address}` | The target address |
 | `{function}` | The qualified name (`Class::Function`, or `function`) |
 | `{original_binary}` | `matching.original_binary`, resolved to an absolute path |
+| `{python}` | The interpreter running ReAgent, for bundled oracles (`{python} -m re_agent.oracles.msvc`) |
 
 The same values are exported as `RE_AGENT_CANDIDATE_FILE`, `RE_AGENT_OVERLAY_ROOT`,
 `RE_AGENT_SOURCE_FILE`, `RE_AGENT_TARGET_ADDRESS`, `RE_AGENT_TARGET_FUNCTION` and
@@ -111,6 +112,72 @@ completed a comparison and prints one JSON object:
 - A nonzero exit (for example a compiler error) is reported with its first and
   last diagnostic lines. Those lines feed the next repair round without spending
   a checker call.
+
+## MSVC projects
+
+`re-agent init --profile msvc-matching` writes a starting configuration: legacy
+MSVC prompt rules (pre-C++11 source, calling conventions, exception frames),
+`smallest-first` selection, reccmp-style annotations for module `GAME`, and the
+bundled oracle. Then:
+
+1. **Identify the compiler.** `re-agent toolchain --binary orig/game.exe` names the
+   tools in the Rich header (for example `C++ 13.10 (VS .NET 2003) build 3077`) and
+   reports `ltcg: true` when objects were compiled with `/GL`, which per-function
+   comparison cannot reproduce. Install that exact compiler, including its service
+   pack, natively or under Wine.
+2. **Annotate the source.** Mark each recovered item with its original address:
+
+   ```cpp
+   // FUNCTION: GAME 0x401000
+   void CFoo::Bar(int x) { ... }
+
+   // GLOBAL: GAME 0x5b0000
+   int g_count;
+
+   // LIBRARY: GAME 0x4a1230
+   // _strcmp
+   ```
+
+   Set `project_profile.annotation_modules` to your module names. Annotations map
+   targets to their definitions, bound function sizes, and name the symbols the
+   oracle resolves. FUNCTION, STUB, TEMPLATE, SYNTHETIC and LIBRARY mark code;
+   GLOBAL and VTABLE mark data. Compiler-generated and library items take their
+   name from the following comment line. Enclosing namespaces and classes qualify
+   names.
+3. **Point the oracle at the compiler.** Adjust `--compile` and the flags after `--`:
+   - Native: `cl /nologo /c {source} /Fo{object}`.
+   - Wine: `wine cl.exe /nologo /c {source_win} /Fo{object_win}`, which passes `Z:\` paths.
+
+   Add `--symbols` with an MSVC `/MAP` file, a JSON or text name list, or a Ghidra
+   export (`{"401000": {"name": "CFoo::Bar", "size": 64}}`), and `--size` when
+   nothing bounds a function. Decorated names are undecorated with MSVC's
+   `undname` or `llvm-undname`, or with a built-in decoder for plain names
+   (`--undname` selects the tool, for example `wine undname.exe`).
+4. **Prove the setup.** Set `matching.canary_address` to a function whose source
+   already matches, run `re-agent doctor`, and search flags with
+   `re-agent toolchain --flags=/O2 --flags="/O2 /Oy-"`. Enable
+   `validation.trust_configured_commands` once the canary is exact.
+
+How the MSVC oracle compares (`python -m re_agent.oracles.msvc --help`):
+
+- Instruction bytes must be identical, except reference fields:
+  - Branch targets and inline data are compared as offsets within the function.
+  - Named symbols are compared by original address.
+  - String literals, floating-point constants and function-local statics are
+    compared by content.
+  - Exception-handler thunks (`__ehhandler$...`) are recognized by their shape.
+- MSVC's switch tables inline after the code are compared entry by entry: jump
+  tables as function offsets, byte index tables as bytes.
+- Candidate symbols that no source resolves show as `?name`. The summary lists
+  them, so the next step is an annotation or a map entry. Overloads that share a
+  qualified name need their decorated names in a map.
+- Without a `.reloc` section (typical of fixed-base game executables), a 32-bit
+  operand counts as an address when it falls inside the image. A constant that
+  happens to look like one shows up as a mismatch, never as a false match.
+
+The oracle supports 32-bit x86 COFF objects and PE images only. For whole-program
+progress and a second opinion, run reccmp as a `validation.runtime_commands` gate
+that fails unless the target function is 100%.
 
 ## What happens during a run
 
@@ -191,9 +258,11 @@ re-agent match-binary --rebuilt build/game.exe --format json
 ```
 
 `toolchain --binary` reports the PE linker version with its Visual Studio release
-(6.0 through 2013, and 14.x as 2015 or later). It also lists decoded Rich header
-records (product id, build number, object count); look these up for the exact
-compiler build. It does not guess flags.
+(6.0 through 2013, and 14.x as 2015 or later). It decodes Rich header records into
+tool names for VC 6.0 through VS 2010 compilers, linkers, MASM and CVTRES, summarizes
+the most-used compiler as `compiler_hint`, and sets `ltcg` when any object was
+compiled for link-time code generation. Unknown product ids stay numeric. It does
+not guess flags.
 
 `match-binary` exits 0 when the files are identical after masking fields that
 legitimately differ between builds of identical code:

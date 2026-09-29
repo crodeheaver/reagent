@@ -21,6 +21,8 @@ def project_fingerprint(config: ReAgentConfig) -> str:
     }
     # Execution-only settings must not change identities recorded by earlier releases.
     values["validation"].pop("parallel_safe", None)
+    if not values["profile"].get("annotation_modules"):
+        values["profile"].pop("annotation_modules", None)  # Absent before annotations existed.
     if config.matching.enabled:
         # Only enabled matching changes what acceptance means; disabled keeps prior identities.
         values["matching"] = asdict(config.matching)

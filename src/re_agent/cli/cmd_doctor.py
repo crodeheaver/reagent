@@ -69,12 +69,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _matching_checks(config: ReAgentConfig, add: Callable[[str, bool, str], None], skip_canary: bool) -> None:
+    import sys
+
     matching = config.matching
-    executable = matching.oracle_command[0]
-    add("match oracle", shutil.which(executable) is not None or Path(executable).is_file(), executable)
-    if matching.permuter_command:
-        permuter = matching.permuter_command[0]
-        add("match permuter", shutil.which(permuter) is not None or Path(permuter).is_file(), permuter)
+    for label, command in (("match oracle", matching.oracle_command), ("match permuter", matching.permuter_command)):
+        if command:
+            executable = sys.executable if command[0] == "{python}" else command[0]
+            add(label, shutil.which(executable) is not None or Path(executable).is_file(), executable)
     for label, value in [("original binary", matching.original_binary),
                          *(("toolchain file", path) for path in matching.toolchain_files)]:
         if value:

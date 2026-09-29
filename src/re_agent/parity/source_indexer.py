@@ -39,6 +39,7 @@ class SourceIndexer:
             for pat in profile.hook_patterns:
                 with contextlib.suppress(re.error):
                     self._hook_patterns.append(re.compile(pat))
+        self._annotation_modules = frozenset(profile.annotation_modules) if profile else frozenset()
         self._class_macro_re: re.Pattern[str] | None = None
         if profile and profile.class_macro:
             with contextlib.suppress(re.error):
@@ -92,6 +93,12 @@ class SourceIndexer:
                             addr = hm.group(2).strip().lower()
                             if fn and addr:
                                 self.hook_address_index[addr] = (file_class, fn)
+            if self._annotation_modules:
+                from re_agent.parity.annotations import SOURCE_KINDS, parse_annotations
+
+                for annotation in parse_annotations(txt, str(path), self._annotation_modules):
+                    if annotation.kind in SOURCE_KINDS and annotation.name:
+                        self.hook_address_index[annotation.address] = annotation.scope_and_name
 
     @staticmethod
     def _find_matching_brace(text: str, open_brace_idx: int) -> int | None:
@@ -404,6 +411,13 @@ class SourceIndexer:
         """
         addr_key = address.strip().lower()
         entry = self.hook_address_index.get(addr_key)
+        if entry is None:
+            # Hooks and annotations may spell the same address with other padding or case.
+            from re_agent.utils.address import normalize_address
+
+            wanted = normalize_address(address)
+            entry = next((value for key, value in self.hook_address_index.items()
+                          if normalize_address(key) == wanted), None)
         if entry is None:
             return None
         cls, fn = entry

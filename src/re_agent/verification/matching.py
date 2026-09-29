@@ -20,6 +20,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from re_agent.core.models import FunctionTarget, MatchVerdict
 from re_agent.utils.process import run_process
 from re_agent.verification.candidate import _NON_CODE, _overlay_root, diagnostic_excerpt
 
-PLACEHOLDERS = ("candidate_file", "overlay_root", "source_file", "address", "function", "original_binary")
+PLACEHOLDERS = ("candidate_file", "overlay_root", "source_file", "address", "function", "original_binary", "python")
 _PLACEHOLDER = re.compile(r"\{(" + "|".join(PLACEHOLDERS) + r")\}")
 
 
@@ -47,6 +48,7 @@ def oracle_values(
         "address": target.address,
         "function": qualified_name(target),
         "original_binary": str(Path(config.original_binary).resolve()) if config.original_binary else "",
+        "python": sys.executable,  # Runs bundled oracles such as re_agent.oracles.msvc with this interpreter.
     }
 
 
